@@ -1,0 +1,36 @@
+[
+    {
+        "query_id": "Q_001",
+        "type": "temporal_drift",
+        "query": "What is the current active database stack utilized by Project ShadowGrid?",
+        "ground_truth": "Asset Qdrant. The system was originally on PostgreSQL but completed a migration to Qdrant, fully decommissioning PostgreSQL.",
+        "target_entities": [
+            "ShadowGrid",
+            "PostgreSQL",
+            "Qdrant"
+        ]
+    },
+    {
+        "query_id": "Q_002",
+        "type": "multi_hop_contradiction",
+        "query": "Who is the primary engineering contact for the project that utilizes Asset Qdrant?",
+        "ground_truth": "Agent Bianca. ShadowGrid uses Qdrant, and while Alexander was the original lead, he was removed and Bianca is now the sole primary contact.",
+        "target_entities": [
+            "ShadowGrid",
+            "Qdrant",
+            "Alexander",
+            "Bianca"
+        ]
+    },
+    {
+        "query_id": "Q_003",
+        "type": "multi_hop",
+        "query": "Which algorithmic concept was introduced to the project managed by Agent Bianca?",
+        "ground_truth": "Concept Vector-Embeddings. It was introduced to Project ShadowGrid, which is now managed by Agent Bianca.",
+        "target_entities": [
+            "Bianca",
+            "ShadowGrid",
+            "Vector-Embeddings"
+        ]
+    }
+]
