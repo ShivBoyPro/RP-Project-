@@ -1,0 +1,5 @@
+{
+    "timestamp": "2026-03-07T09:00:00",
+    "doc_id": "cobaltmesh_002",
+    "content": "Agent Ivo introduces Concept Cross-Encoder-Rerank to CobaltMesh. The system utilizes HuggingFace models for embedding computation. Asset MySQL handles metadata storage."
+}

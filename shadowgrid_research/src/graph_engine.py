@@ -1,78 +1,122 @@
-import os
-import json
+import hashlib
+import heapq
+import math
+from collections import defaultdict
+
+class BoundedChunkStore:
+    def __init__(self, max_chunks=5000):
+        self.max_chunks = max_chunks
+        self.chunks = {}  # chunk_id -> raw_text
+        self.edge_to_chunks = {}  # (src, tgt) -> set(chunk_ids)
+        self.chunk_queue = []  # FIFO queue for text chunks
+        
+    def add_extraction(self, src, tgt, text):
+        chunk_id = hashlib.md5(text.encode('utf-8')).hexdigest()
+        
+        if chunk_id not in self.chunks:
+            if len(self.chunks) >= self.max_chunks:
+                victim_id = self.chunk_queue.pop(0)
+                del self.chunks[victim_id]
+                
+                for e_key in list(self.edge_to_chunks.keys()):
+                    self.edge_to_chunks[e_key].discard(victim_id)
+                    if not self.edge_to_chunks[e_key]:
+                        del self.edge_to_chunks[e_key]
+                        
+            self.chunks[chunk_id] = text
+            self.chunk_queue.append(chunk_id)
+            
+        if (src, tgt) not in self.edge_to_chunks:
+            self.edge_to_chunks[(src, tgt)] = set()
+        self.edge_to_chunks[(src, tgt)].add(chunk_id)
+
+    def get_context(self, src, tgt):
+        chunk_ids = self.edge_to_chunks.get((src, tgt), set())
+        return [self.chunks[cid] for cid in chunk_ids if cid in self.chunks]
+        
+import hashlib
+import heapq
+import math
+from collections import defaultdict
 
 class BoundedGraphRAGEngine:
-    def __init__(self, max_edges=float('inf')):
+    def __init__(self, max_edges=1000):
         self.max_edges = max_edges
-        self.nodes = set()
-        self.edges = {}  # Format: (source, target): weight or entropy
+        self.node_degrees = defaultdict(int)
+        self.adjacency = defaultdict(set)  # Required for O(1) neighborhood resolution
+        self.edges = {}  # (src, tgt) -> true_current_entropy
+        self.eviction_heap = [] 
         
-    def ingest_streaming_data(self):
-        corpus_path = "data/corpus_large.json"
-        if not os.path.exists(corpus_path):
-            corpus_path = "data/corpus.json"
-            
-        if not os.path.exists(corpus_path):
+    def _compute_local_edge_entropy(self, src, tgt):
+        deg_src = self.node_degrees.get(src, 1)
+        deg_tgt = self.node_degrees.get(tgt, 1)
+        total_edges = max(len(self.edges), 1)
+        
+        p_src = deg_src / (2 * total_edges)
+        p_tgt = deg_tgt / (2 * total_edges)
+        
+        return - (p_src * math.log2(p_src) + p_tgt * math.log2(p_tgt))
+
+    def _garbage_collect_nodes(self, src, tgt):
+        for node in (src, tgt):
+            self.node_degrees[node] -= 1
+            if self.node_degrees[node] <= 0:
+                del self.node_degrees[node]
+                if node in self.adjacency:
+                    del self.adjacency[node]
+
+    def _update_and_push(self, src, tgt):
+        """Calculates current entropy and pushes to heap. Leaves stale duplicates in heap to be lazy-deleted."""
+        entropy = self._compute_local_edge_entropy(src, tgt)
+        self.edges[(src, tgt)] = entropy
+        heapq.heappush(self.eviction_heap, (-entropy, src, tgt))
+
+    def insert_edge(self, src, tgt):
+        if src == tgt or (src, tgt) in self.edges or (tgt, src) in self.edges:
             return
+
+        # 1. Update Topology
+        self.node_degrees[src] += 1
+        self.node_degrees[tgt] += 1
+        self.adjacency[src].add(tgt)
+        self.adjacency[tgt].add(src)
+        
+        # 2. Add New Edge
+        self._update_and_push(src, tgt)
+        
+        # 3. Localized Topological Recalculation O(D)
+        # Prevents the heap from decaying into temporal staleness
+        for node in (src, tgt):
+            for neighbor in self.adjacency[node]:
+                if neighbor == tgt and node == src: continue
+                e = (node, neighbor) if (node, neighbor) in self.edges else (neighbor, node)
+                if e in self.edges:
+                    self._update_and_push(e[0], e[1])
+
+        # 4. Lazy-Evaluation Eviction Loop
+        while len(self.edges) > self.max_edges:
+            neg_entropy, victim_src, victim_tgt = heapq.heappop(self.eviction_heap)
             
-        with open(corpus_path, "r") as f:
-            data = json.load(f)
+            # STALE CHECK: If the heap value doesn't match the true current value, it's a ghost entry. Burn it.
+            current_true_entropy = self.edges.get((victim_src, victim_tgt))
+            if current_true_entropy is None or neg_entropy != -current_true_entropy:
+                continue 
             
-        # Clear state for clean parameter sweep iterations
-        self.nodes = set()
-        self.edges = {}
+            # Execute Eviction
+            del self.edges[(victim_src, victim_tgt)]
+            self.adjacency[victim_src].discard(victim_tgt)
+            self.adjacency[victim_tgt].discard(victim_src)
+            self._garbage_collect_nodes(victim_src, victim_tgt)
 
-        # Scan for explicit relational entities in the high-density text
-        for item in data:
-            content = item.get("content", "")
-            
-            # Extract and form programmatic graph relationships
-            discovered_relations = []
-            if "PostgreSQL" in content and "Alexander" in content:
-                discovered_relations.append(("ShadowGrid", "Alexander", -2.2))
-            if "Vector-Embeddings" in content:
-                discovered_relations.append(("ShadowGrid", "Vector-Embeddings", -5.15))
-            if "PostgreSQL" in content and "Qdrant" not in content:
-                discovered_relations.append(("ShadowGrid", "PostgreSQL", -2.9))
-            if "Qdrant" in content:
-                discovered_relations.append(("ShadowGrid", "Qdrant", -5.0))
-            if "Bianca" in content and "Verification-Run-1" in content:
-                discovered_relations.append(("Bianca", "Verification-Run-1", -2.3))
+    def retrieve_subgraph_context(self, target_entities, chunk_store):
+        valid_targets = set(target_entities) & set(self.node_degrees.keys())
+        if not valid_targets:
+            return ""
 
-            for src, tgt, weight in discovered_relations:
-                self.nodes.add(src)
-                self.nodes.add(tgt)
-                self.edges[(src, tgt)] = weight
-                
-                # Dynamic Bounded Eviction Engine Loop
-                if len(self.edges) > self.max_edges:
-                    # Evict edge with the highest entropy value (closest to 0 or highest value)
-                    victim_edge = max(self.edges, key=self.edges.get)
-                    print(f"[EVICTION ENGINE] Evicting low-signal edge: {victim_edge} | Weight: {self.edges[victim_edge]}")
-                    del self.edges[victim_edge]
-
-        print(f"[SUCCESS] Streaming ingestion complete. Active Graph State: Nodes={len(self.nodes)}, Edges={len(self.edges)}")
-
-    def retrieve_subgraph(self, target_entities):
         matched_contexts = []
-        corpus_path = "data/corpus_large.json" if os.path.exists("data/corpus_large.json") else "data/corpus.json"
-        
-        with open(corpus_path, "r") as f:
-            data = json.load(f)
-
-        # Build local sub-adjacency map from remaining non-evicted edges
-        active_nodes = set()
-        for src, tgt in self.edges.keys():
-            active_nodes.add(src)
-            active_nodes.add(tgt)
-
-        # Filter entities that survived pruning
-        valid_targets = [ent for ent in target_entities if ent in active_nodes]
-        
-        for item in data:
-            content = item.get("content", "")
-            for entity in valid_targets:
-                if entity in content and content not in matched_contexts:
-                    matched_contexts.append(content)
-                    
-        return "\n".join(matched_contexts)
+        for (src, tgt) in self.edges.keys():
+            if src in valid_targets or tgt in valid_targets:
+                for text in chunk_store.get_context(src, tgt):
+                    matched_contexts.append(text)
+                
+        return "\n".join(set(matched_contexts))

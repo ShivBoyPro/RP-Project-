@@ -1,94 +1,330 @@
 import os
 import json
+import random
+import re
+import time
 from datetime import datetime, timedelta
+from groq import Groq
+from graph_engine import BoundedChunkStore, BoundedGraphRAGEngine
+
+
+# ---------------------------------------------------------------------------
+# Deterministic world model
+#
+# Instead of hand-writing 50 documents and 20 queries independently (which
+# risks the ground_truth in the eval suite silently drifting out of sync
+# with what the corpus actually says), both are generated FROM the same
+# underlying "world state" per project. The eval suite's ground_truth is
+# read directly off this world state, so it's guaranteed correct relative
+# to whatever documents were generated - not retyped by hand.
+#
+# Entity pools are deliberately reused across projects (e.g. every project
+# starts on "PostgreSQL") so that querying "who uses Qdrant now" or "who is
+# project X's primary contact" is genuinely ambiguous without correctly
+# resolving cross-project relations - this is what creates real structural
+# noise/density, rather than noise docs that are trivially distinguishable
+# from signal docs.
+# ---------------------------------------------------------------------------
+
+PROJECT_NAMES = ["ShadowGrid", "IronVault", "NightOwl", "CobaltMesh", "SilentTide"]
+ENGINEER_POOL = ["Alexander", "Bianca", "Desmond", "Farah", "Grigori", "Hana", "Ivo", "Junko"]
+OLD_DB_POOL = ["PostgreSQL", "MySQL", "MongoDB"]
+NEW_DB_POOL = ["Qdrant", "Pinecone", "Weaviate"]
+CONCEPT_POOL = ["Vector-Embeddings", "Sparse-Retrieval", "Cross-Encoder-Rerank", "Hybrid-Search"]
+EVENT_POOL = ["Verification-Run-1", "Audit-Cycle-Alpha", "Compliance-Sweep-2", "Load-Test-Beta"]
+
+
+class ProjectWorld:
+    """A single project's deterministic timeline: two engineers (one
+    removed, one becomes primary), a DB migration, a concept introduction,
+    and a validation event. Every field is drawn from the shared pools so
+    the same entity name (e.g. 'PostgreSQL') recurs across multiple,
+    otherwise-unrelated projects.
+    """
+
+    def __init__(self, project_name, rng, start_time):
+        self.project_name = project_name
+        self.engineer_initial = rng.choice(ENGINEER_POOL)
+        remaining_engineers = [e for e in ENGINEER_POOL if e != self.engineer_initial]
+        self.engineer_final = rng.choice(remaining_engineers)
+        self.db_old = rng.choice(OLD_DB_POOL)
+        self.db_new = rng.choice(NEW_DB_POOL)
+        self.concept = rng.choice(CONCEPT_POOL)
+        self.event = rng.choice(EVENT_POOL)
+        self.start_time = start_time
+
+    def documents(self):
+        t = self.start_time
+        docs = [
+            {
+                "timestamp": t.isoformat(),
+                "doc_id": f"{self.project_name.lower()}_001",
+                "content": (
+                    f"Project {self.project_name} initiates development. The core infrastructure is "
+                    f"established to utilize a {self.db_old} instance as its primary database "
+                    f"architecture. Core engineering contact is Agent {self.engineer_initial}."
+                ),
+            },
+            {
+                "timestamp": (t + timedelta(days=30)).isoformat(),
+                "doc_id": f"{self.project_name.lower()}_002",
+                "content": (
+                    f"Agent {self.engineer_initial} introduces Concept {self.concept} to "
+                    f"{self.project_name}. The system utilizes HuggingFace models for embedding "
+                    f"computation. Asset {self.db_old} handles metadata storage."
+                ),
+            },
+            {
+                "timestamp": (t + timedelta(days=60)).isoformat(),
+                "doc_id": f"{self.project_name.lower()}_003",
+                "content": (
+                    f"CRITICAL INFRASTRUCTURE UPDATE: Project {self.project_name} completely "
+                    f"migrates away from {self.db_old}. Asset {self.db_old} is fully "
+                    f"decommissioned. The current database stack for {self.project_name} is now "
+                    f"completely transitioned to Asset {self.db_new} for vector and metadata handling."
+                ),
+            },
+            {
+                "timestamp": (t + timedelta(days=90)).isoformat(),
+                "doc_id": f"{self.project_name.lower()}_004",
+                "content": (
+                    f"Agent {self.engineer_final} joins Project {self.project_name} to supervise "
+                    f"evaluation loops. {self.engineer_final} updates the pipeline settings, "
+                    f"establishing Event {self.event} to validate accuracy."
+                ),
+            },
+            {
+                "timestamp": (t + timedelta(days=120)).isoformat(),
+                "doc_id": f"{self.project_name.lower()}_005",
+                "content": (
+                    f"Personnel reassignment: Agent {self.engineer_initial} is completely removed "
+                    f"from Project {self.project_name} and moved to internal infrastructure. Agent "
+                    f"{self.engineer_final} is now the sole primary contact and lead engineer for "
+                    f"{self.project_name} development."
+                ),
+            },
+        ]
+        return docs
+
+    def queries(self):
+        return [
+            {
+                "query_id": f"{self.project_name}_Q_temporal_drift",
+                "type": "temporal_drift",
+                "query": f"What is the current active database stack utilized by Project {self.project_name}?",
+                "ground_truth": (
+                    f"Asset {self.db_new}. The system was originally on {self.db_old} but completed "
+                    f"a migration to {self.db_new}, fully decommissioning {self.db_old}."
+                ),
+                "target_entities": [self.project_name, self.db_old, self.db_new],
+            },
+            {
+                "query_id": f"{self.project_name}_Q_multi_hop_contradiction",
+                "type": "multi_hop_contradiction",
+                "query": f"Who is the primary engineering contact for the project that utilizes Asset {self.db_new}?",
+                "ground_truth": (
+                    f"Agent {self.engineer_final}. {self.project_name} uses {self.db_new}, and while "
+                    f"{self.engineer_initial} was the original lead, they were removed and "
+                    f"{self.engineer_final} is now the sole primary contact."
+                ),
+                "target_entities": [self.project_name, self.db_new, self.engineer_initial, self.engineer_final],
+            },
+            {
+                "query_id": f"{self.project_name}_Q_multi_hop_concept",
+                "type": "multi_hop",
+                "query": f"Which algorithmic concept was introduced to the project managed by Agent {self.engineer_final}?",
+                "ground_truth": (
+                    f"Concept {self.concept}. It was introduced to Project {self.project_name}, which "
+                    f"is now managed by Agent {self.engineer_final}."
+                ),
+                "target_entities": [self.engineer_final, self.project_name, self.concept],
+            },
+            {
+                "query_id": f"{self.project_name}_Q_entity_lookup",
+                "type": "entity_lookup",
+                "query": f"Who was the initial engineer for Project {self.project_name}?",
+                "ground_truth": f"Agent {self.engineer_initial}.",
+                "target_entities": [self.project_name, self.engineer_initial],
+            },
+        ]
+
 
 class StreamingDatasetGenerator:
-    def __init__(self, base_dir="data"):
+    def __init__(self, base_dir="data", num_projects=5, noise_docs=25, seed=42):
         self.base_dir = base_dir
         self.corpus_dir = os.path.join(base_dir, "raw_corpus")
         self.eval_file = os.path.join(base_dir, "evaluation_suite.json")
-        
+        self.num_projects = num_projects
+        self.noise_docs = noise_docs
+        self.rng = random.Random(seed)  # seeded for reproducibility across runs
+
         os.makedirs(self.corpus_dir, exist_ok=True)
 
-    def generate_streaming_corpus(self):
-        """
-        Generates a sequence of chronologically tracked documents simulating 
-        corporate project updates with embedded temporal contradictions.
-        """
-        start_time = datetime(2026, 1, 1, 9, 0, 0)
-        
-        # Timeline updates mapping specific entity states
-        streaming_docs = [
-            {
-                "timestamp": (start_time).isoformat(),
-                "doc_id": "doc_001",
-                "content": "Project ShadowGrid initiates development. The core infrastructure is established to utilize a PostgreSQL instance as its primary database architecture. Core engineering contact is Agent Alexander."
-            },
-            {
-                "timestamp": (start_time + timedelta(days=30)).isoformat(),
-                "doc_id": "doc_002",
-                "content": "Agent Alexander introduces Concept Vector-Embeddings to ShadowGrid. The system utilizes HuggingFace models for embedding computation. Asset PostgreSQL handles metadata storage."
-            },
-            {
-                "timestamp": (start_time + timedelta(days=60)).isoformat(),
-                "doc_id": "doc_003",
-                "content": "CRITICAL INFRASTRUCTURE UPDATE: Project ShadowGrid completely migrates away from PostgreSQL. Asset PostgreSQL is fully decommissioned. The current database stack for ShadowGrid is now completely transitioned to Asset Qdrant for vector and metadata handling."
-            },
-            {
-                "timestamp": (start_time + timedelta(days=90)).isoformat(),
-                "doc_id": "doc_004",
-                "content": "Agent Bianca joins Project ShadowGrid to supervise evaluation loops. Bianca updates the pipeline settings, establishing Event Verification-Run-1 on June 1st to validate accuracy."
-            },
-            {
-                "timestamp": (start_time + timedelta(days=120)).isoformat(),
-                "doc_id": "doc_005",
-                "content": "Personnel reassignment: Agent Alexander is completely removed from Project ShadowGrid and moved to internal infrastructure. Agent Bianca is now the sole primary contact and lead engineer for ShadowGrid development."
-            }
-        ]
+        if num_projects > len(PROJECT_NAMES):
+            raise ValueError(f"Only {len(PROJECT_NAMES)} project names defined; requested {num_projects}")
 
-        # Write streaming timeline units out as distinct chronological files
-        for doc in streaming_docs:
+        self.worlds = []
+        base_start = datetime(2026, 1, 1, 9, 0, 0)
+        for i, name in enumerate(PROJECT_NAMES[:num_projects]):
+            # Stagger project start times so timestamps interleave rather
+            # than each project's 5 docs sitting in one contiguous block.
+            project_start = base_start + timedelta(days=self.rng.randint(0, 20) + i * 5)
+            self.worlds.append(ProjectWorld(name, self.rng, project_start))
+
+    def _generate_noise_docs(self):
+        noise = []
+        for i in range(1, self.noise_docs + 1):
+            noise.append({
+                "timestamp": (datetime(2026, 1, 1, 9, 0, 0) + timedelta(hours=self.rng.randint(0, 4000))).isoformat(),
+                "doc_id": f"noise_{i:03d}",
+                "content": (
+                    f"Infrastructure log sequence reference alpha-{i * 100}. System operations "
+                    f"running within normal parameters. Storage array check completed for cluster "
+                    f"node {i}."
+                ),
+            })
+        return noise
+
+    def generate_streaming_corpus(self):
+        all_docs = []
+        for world in self.worlds:
+            all_docs.extend(world.documents())
+        all_docs.extend(self._generate_noise_docs())
+
+        # Sort by timestamp so the corpus reads as one interleaved stream
+        # across projects, matching how a real ingestion feed would arrive.
+        all_docs.sort(key=lambda d: d["timestamp"])
+
+        for doc in all_docs:
             file_path = os.path.join(self.corpus_dir, f"{doc['doc_id']}.json")
             with open(file_path, "w") as f:
                 json.dump(doc, f, indent=4)
-        
-        print(f"[SUCCESS] Injected {len(streaming_docs)} streaming documents into {self.corpus_dir}")
+
+        print(f"[SUCCESS] Injected {len(all_docs)} streaming documents into {self.corpus_dir} "
+              f"({sum(len(w.documents()) for w in self.worlds)} signal, {self.noise_docs} noise)")
+
+        monolithic_path = os.path.join(self.base_dir, "corpus.json")
+        with open(monolithic_path, "w") as f:
+            json.dump(all_docs, f, indent=4)
+        print(f"[SUCCESS] Exported monolithic baseline corpus to {monolithic_path}")
 
     def generate_evaluation_suite(self):
-        """
-        Generates targeted cross-examination queries designed to break systems
-        that cannot handle multi-hop navigation or state changes over time.
-        """
-        queries = [
-            {
-                "query_id": "Q_001",
-                "type": "temporal_drift",
-                "query": "What is the current active database stack utilized by Project ShadowGrid?",
-                "ground_truth": "Asset Qdrant. The system was originally on PostgreSQL but completed a migration to Qdrant, fully decommissioning PostgreSQL.",
-                "target_entities": ["ShadowGrid", "PostgreSQL", "Qdrant"]
-            },
-            {
-                "query_id": "Q_002",
-                "type": "multi_hop_contradiction",
-                "query": "Who is the primary engineering contact for the project that utilizes Asset Qdrant?",
-                "ground_truth": "Agent Bianca. ShadowGrid uses Qdrant, and while Alexander was the original lead, he was removed and Bianca is now the sole primary contact.",
-                "target_entities": ["ShadowGrid", "Qdrant", "Alexander", "Bianca"]
-            },
-            {
-                "query_id": "Q_003",
-                "type": "multi_hop",
-                "query": "Which algorithmic concept was introduced to the project managed by Agent Bianca?",
-                "ground_truth": "Concept Vector-Embeddings. It was introduced to Project ShadowGrid, which is now managed by Agent Bianca.",
-                "target_entities": ["Bianca", "ShadowGrid", "Vector-Embeddings"]
-            }
-        ]
+        queries = []
+        for world in self.worlds:
+            queries.extend(world.queries())
 
         with open(self.eval_file, "w") as f:
             json.dump(queries, f, indent=4)
-        
-        print(f"[SUCCESS] Compiled evaluation suite with {len(queries)} gold-standard tasks at {self.eval_file}")
 
-if __name__ == "__main__":
-    generator = StreamingDatasetGenerator()
+        print(f"[SUCCESS] Compiled evaluation suite with {len(queries)} gold-standard tasks "
+              f"({self.num_projects} projects x 4 query types) at {self.eval_file}")
+
+
+client = Groq()  # Fails immediately if GROQ_API_KEY env var is missing
+
+
+def extract_relations_streaming(chunk_text, max_retries=5):
+    """
+    Extracts entity relation pairs via Groq. Includes 429 retry/backoff -
+    at 50 docs, sequential extraction calls will hit the TPM rate limit
+    partway through; without backoff, later documents in the corpus would
+    silently contribute zero edges (extraction "dropped"), skewing the
+    graph toward whichever projects happened to be ingested first.
+    """
+    prompt = f"""
+Analyze the text and extract direct relationships between technical entities.
+Output ONLY a JSON object with a single key "relations" containing an array of pairs.
+Format: {{"relations": [["EntityA", "EntityB"]]}}
+Do not invent relationships. Ignore generic nouns.
+
+Text: {chunk_text}
+"""
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                temperature=0.0,
+            )
+
+            parsed = json.loads(response.choices[0].message.content)
+
+            valid_relations = []
+            for pair in parsed.get("relations", []):
+                if isinstance(pair, list) and len(pair) == 2:
+                    valid_relations.append(tuple(pair))
+
+            return valid_relations
+
+        except Exception as e:
+            body = str(e)
+            last_error = body
+            match = re.search(r"try again in ([\d.]+)s", body)
+            if match:
+                wait = float(match.group(1)) + 0.5
+                print(f"[RATE LIMIT] backing off {wait:.2f}s (attempt {attempt + 1}/{max_retries})")
+                time.sleep(wait)
+                continue
+            if "429" in body or "rate_limit" in body:
+                wait = 2 ** attempt
+                print(f"[RATE LIMIT] backing off {wait:.2f}s (attempt {attempt + 1}/{max_retries})")
+                time.sleep(wait)
+                continue
+            # Non-rate-limit failure - not retryable
+            print(f"[EXTRACTION DROPPED] Model failure: {e}")
+            return []
+
+    print(f"[EXTRACTION DROPPED] Max retries exceeded, last failure -> {last_error}")
+    return []
+
+
+def run_pipeline(num_projects=5, noise_docs=25):
+    generator = StreamingDatasetGenerator(num_projects=num_projects, noise_docs=noise_docs)
     generator.generate_streaming_corpus()
     generator.generate_evaluation_suite()
+
+    corpus_dir = "data/raw_corpus"
+    if not os.path.exists(corpus_dir):
+        print(f"Corpus directory {corpus_dir} not found.")
+        return
+
+    chunk_store = BoundedChunkStore(max_chunks=2000)
+    engine = BoundedGraphRAGEngine(max_edges=1000)
+
+    files = sorted([f for f in os.listdir(corpus_dir) if f.endswith(".json")])
+    docs_with_zero_relations = []
+
+    for idx, filename in enumerate(files, 1):
+        with open(os.path.join(corpus_dir, filename), "r") as f:
+            doc = json.load(f)
+
+        raw_text = doc.get("content", "")
+
+        relations = extract_relations_streaming(raw_text)
+
+        print(f"[EXTRACTION] doc={doc.get('doc_id', filename)} -> "
+              f"{relations if relations else '[]  <-- NO RELATIONS EXTRACTED'}")
+        print(f"  source text: {raw_text}")
+
+        if not relations:
+            docs_with_zero_relations.append(doc.get("doc_id", filename))
+
+        for src, tgt in relations:
+            engine.insert_edge(src, tgt)
+            chunk_store.add_extraction(src, tgt, raw_text)
+
+        if idx % 10 == 0:
+            print(f"[PROGRESS] {idx}/{len(files)} documents processed | "
+                  f"Nodes={len(engine.node_degrees)}, Edges={len(engine.edges)}")
+
+    print(f"[STREAMING COMPLETE] Active Graph State: Nodes={len(engine.node_degrees)}, Edges={len(engine.edges)}")
+    print(f"[EXTRACTION SUMMARY] {len(docs_with_zero_relations)}/{len(files)} documents produced "
+          f"zero relations ({len(docs_with_zero_relations) / len(files) * 100:.1f}% extraction failure rate)")
+    if docs_with_zero_relations:
+        print(f"  Zero-relation doc_ids: {docs_with_zero_relations}")
+
+
+if __name__ == "__main__":
+    run_pipeline(num_projects=5, noise_docs=25)

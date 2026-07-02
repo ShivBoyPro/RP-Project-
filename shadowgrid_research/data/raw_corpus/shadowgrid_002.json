@@ -1,0 +1,5 @@
+{
+    "timestamp": "2026-02-20T09:00:00",
+    "doc_id": "shadowgrid_002",
+    "content": "Agent Bianca introduces Concept Sparse-Retrieval to ShadowGrid. The system utilizes HuggingFace models for embedding computation. Asset MongoDB handles metadata storage."
+}

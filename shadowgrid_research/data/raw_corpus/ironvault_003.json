@@ -1,0 +1,5 @@
+{
+    "timestamp": "2026-03-11T09:00:00",
+    "doc_id": "ironvault_003",
+    "content": "CRITICAL INFRASTRUCTURE UPDATE: Project IronVault completely migrates away from MongoDB. Asset MongoDB is fully decommissioned. The current database stack for IronVault is now completely transitioned to Asset Weaviate for vector and metadata handling."
+}

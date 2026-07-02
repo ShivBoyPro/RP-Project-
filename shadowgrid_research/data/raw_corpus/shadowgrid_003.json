@@ -1,0 +1,5 @@
+{
+    "timestamp": "2026-03-22T09:00:00",
+    "doc_id": "shadowgrid_003",
+    "content": "CRITICAL INFRASTRUCTURE UPDATE: Project ShadowGrid completely migrates away from MongoDB. Asset MongoDB is fully decommissioned. The current database stack for ShadowGrid is now completely transitioned to Asset Pinecone for vector and metadata handling."
+}

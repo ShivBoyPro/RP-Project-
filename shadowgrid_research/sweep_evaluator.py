@@ -2,16 +2,20 @@ import json
 import os
 import re
 import time
+import itertools
 import urllib.request
 import urllib.error
 import ssl
 from src.vector_engine import VectorRAGEngine
-from src.graph_engine import BoundedGraphRAGEngine
+from src.graph_engine import BoundedGraphRAGEngine, BoundedChunkStore
 
 
 class SweepEvaluator:
-    def __init__(self, eval_suite_path="data/evaluation_suite.json", cloud_model="llama-3.1-8b-instant"):
+    def __init__(self, eval_suite_path="data/evaluation_suite.json",
+                 corpus_path="data/corpus.json",
+                 cloud_model="llama-3.1-8b-instant"):
         self.eval_suite_path = eval_suite_path
+        self.corpus_path = corpus_path
         self.cloud_model = cloud_model
         self.api_key = os.environ.get("GROQ_API_KEY")
 
@@ -19,6 +23,8 @@ class SweepEvaluator:
             raise ValueError("CRITICAL FAILURE: GROQ_API_KEY environment variable is not set. Get one at console.groq.com")
 
         self.queries = self.load_evaluation_suite()
+        self.corpus = self.load_corpus()
+        self.entity_vocab = self.build_entity_vocab()
 
     def load_evaluation_suite(self):
         if not os.path.exists(self.eval_suite_path):
@@ -31,6 +37,50 @@ class SweepEvaluator:
                 json.dump(mock_suite, f, indent=4)
         with open(self.eval_suite_path, "r") as f:
             return json.load(f)
+
+    def load_corpus(self):
+        if not os.path.exists(self.corpus_path):
+            raise FileNotFoundError(f"Corpus not found at {self.corpus_path}")
+        with open(self.corpus_path, "r") as f:
+            return json.load(f)
+
+    def build_entity_vocab(self):
+        """
+        Entity vocabulary is derived from target_entities across the eval
+        suite rather than hardcoded, so ingestion tracks whatever entities
+        the eval suite actually cares about, without needing to be edited
+        every time queries/entities change.
+        """
+        vocab = set()
+        for q in self.queries:
+            vocab.update(q.get("target_entities", []))
+        # Longer names first, so e.g. "Verification-Run-1" is matched whole
+        # rather than accidentally short-circuited by a shorter substring.
+        return sorted(vocab, key=len, reverse=True)
+
+    def extract_pairs_from_doc(self, text):
+        """
+        Deterministic co-occurrence extraction: find every known entity that
+        appears in this document's text, then link every pair of them. This
+        reproduces the pattern seen in prior real ingestion logs (e.g.
+        ('Bianca', 'Verification-Run-1') appearing without 'ShadowGrid'
+        present in the same edge) - i.e. genuine pairwise co-occurrence,
+        not a hub-and-spoke model centered on one entity.
+        """
+        present = [e for e in self.entity_vocab if e in text]
+        pairs = []
+        for src, tgt in itertools.combinations(sorted(set(present)), 2):
+            pairs.append((src, tgt))
+        return pairs
+
+    def ingest_corpus(self, graph_engine, chunk_store):
+        for doc in self.corpus:
+            text = doc.get("content", "")
+            if not text:
+                continue
+            for src, tgt in self.extract_pairs_from_doc(text):
+                graph_engine.insert_edge(src, tgt)
+                chunk_store.add_extraction(src, tgt, text)
 
     def query_cloud_llm(self, prompt, max_retries=5):
         url = "https://api.groq.com/openai/v1/chat/completions"
@@ -77,9 +127,9 @@ class SweepEvaluator:
 
         return f"ERROR: max retries exceeded, last failure -> {last_error}"
 
-    def verify_accuracy_with_judge(self, query, ground_truth, model_output):
+    def verify_accuracy_with_judge(self, query, ground_truth, model_output, query_id=None):
         if model_output.startswith("ERROR"):
-            print(f"\n--- RAG OUTPUT CALL FAILED (excluded from scoring) ---")
+            print(f"\n--- RAG OUTPUT CALL FAILED (excluded from scoring) [query_id={query_id}] ---")
             print(model_output)
             print(f"--------------------------\n")
             return None
@@ -102,11 +152,12 @@ GRADE: <1 or 0>
 """
         raw_response = self.query_cloud_llm(judge_prompt).strip()
 
-        print(f"\n--- JUDGE RAW THOUGHTS ---")
+        print(f"\n--- JUDGE RAW THOUGHTS [query_id={query_id}] ---")
         print(raw_response)
         print(f"--------------------------\n")
 
         if raw_response.startswith("ERROR"):
+            print(f"[EXCLUDED] Judge call failed for query_id={query_id}")
             return None
 
         lines = raw_response.split("\n")
@@ -117,89 +168,135 @@ GRADE: <1 or 0>
                 if "0" in line:
                     return 0
 
-        print("[WARN] No GRADE line found in judge response - excluding from scoring")
+        print(f"[WARN] No GRADE line found in judge response for query_id={query_id} - excluding from scoring")
         return None
 
     @staticmethod
-    def _score_summary(scores):
-        valid = [s for s in scores if s is not None]
-        excluded = len(scores) - len(valid)
-        accuracy = (sum(valid) / len(valid) * 100) if valid else float("nan")
-        return accuracy, excluded, len(valid)
+    def _score_summary(records):
+        """
+        records: list of dicts {query_id, type, score} where score is
+        1, 0, or None (excluded - infra/parsing failure, not a wrong answer).
+        Returns overall accuracy/excluded/n plus a per-query-type breakdown,
+        so failures that cluster in one query type (e.g.
+        multi_hop_contradiction, which requires resolving cross-project
+        ambiguity) are visible instead of averaged away into one number.
+        """
+        valid = [r for r in records if r["score"] is not None]
+        excluded = len(records) - len(valid)
+        accuracy = (sum(r["score"] for r in valid) / len(valid) * 100) if valid else float("nan")
+
+        by_type = {}
+        for r in records:
+            by_type.setdefault(r["type"], []).append(r["score"])
+
+        type_breakdown = {}
+        for qtype, scores in by_type.items():
+            valid_t = [s for s in scores if s is not None]
+            excl_t = len(scores) - len(valid_t)
+            acc_t = (sum(valid_t) / len(valid_t) * 100) if valid_t else float("nan")
+            type_breakdown[qtype] = (acc_t, excl_t, len(valid_t))
+
+        return accuracy, excluded, len(valid), type_breakdown
 
     def evaluate_vector_baseline(self):
         vector_engine = VectorRAGEngine()
-        scores = []
+        records = []
 
         print("\n=== STARTING VECTOR BASELINE EVALUATION ===")
         for q in self.queries:
+            qid = q.get("query_id", q["query"])
+            qtype = q.get("type", "unknown")
+
             res = vector_engine.retrieve(q['query'], k=2)
             context = "\n".join([doc['content'] for doc in res])
-            
-            print(f"\n[DIAGNOSTIC] Query: {q['query']}")
+
+            print(f"\n[DIAGNOSTIC] Query: {q['query']} [id={qid}, type={qtype}]")
             print(f"--- RAW VECTOR CONTEXT SURFACE ---")
             print(context if context.strip() else "[EMPTY CONTEXT]")
             print(f"----------------------------------")
-            
-            # Change this line in both evaluation methods:
+
             prompt = f"Context:\n{context}\n\nQuestion: {q['query']}\nAnswer thoroughly, including all relevant background details, project names, and migration history mentioned in the context."
             output = self.query_cloud_llm(prompt)
             print(f"[LLM OUTPUT]: {output}")
-            
-            score = self.verify_accuracy_with_judge(q['query'], q['ground_truth'], output)
-            scores.append(score)
 
-        return self._score_summary(scores)
+            score = self.verify_accuracy_with_judge(q['query'], q['ground_truth'], output, query_id=qid)
+            records.append({"query_id": qid, "type": qtype, "score": score})
+
+        return self._score_summary(records)
 
     def evaluate_graph_engine(self, max_edges):
         graph_engine = BoundedGraphRAGEngine(max_edges=max_edges)
-        graph_engine.ingest_streaming_data()
-        scores = []
+        chunk_store = BoundedChunkStore()
+        self.ingest_corpus(graph_engine, chunk_store)
+
+        print(f"[SUCCESS] Streaming ingestion complete. Active Graph State: "
+              f"Nodes={len(graph_engine.node_degrees)}, Edges={len(graph_engine.edges)}")
+
+        records = []
 
         print(f"\n=== STARTING GRAPH RAG EVALUATION (max_edges={max_edges}) ===")
         for q in self.queries:
-            context = graph_engine.retrieve_subgraph(q['target_entities'])
-            
-            print(f"\n[DIAGNOSTIC] Query: {q['query']}")
+            qid = q.get("query_id", q["query"])
+            qtype = q.get("type", "unknown")
+
+            context = graph_engine.retrieve_subgraph_context(q['target_entities'], chunk_store)
+
+            print(f"\n[DIAGNOSTIC] Query: {q['query']} [id={qid}, type={qtype}]")
             print(f"--- RAW GRAPH CONTEXT SURFACE ---")
             print(context if context.strip() else "[EMPTY CONTEXT]")
             print(f"---------------------------------")
-            
-            # Change this line in both evaluation methods:
+
             prompt = f"Context:\n{context}\n\nQuestion: {q['query']}\nAnswer thoroughly, including all relevant background details, project names, and migration history mentioned in the context."
             output = self.query_cloud_llm(prompt)
             print(f"[LLM OUTPUT]: {output}")
-            
-            score = self.verify_accuracy_with_judge(q['query'], q['ground_truth'], output)
-            scores.append(score)
 
-        return self._score_summary(scores)
+            score = self.verify_accuracy_with_judge(q['query'], q['ground_truth'], output, query_id=qid)
+            records.append({"query_id": qid, "type": qtype, "score": score})
+
+        return self._score_summary(records)
 
     def execute_sweep(self):
         results = {}
 
         print("[RUNNING] Evaluating Control Group A: Baseline Vector-RAG...")
-        acc, excluded, n = self.evaluate_vector_baseline()
-        results["Vector-RAG (Control A)"] = (acc, excluded, n)
+        acc, excluded, n, breakdown = self.evaluate_vector_baseline()
+        results["Vector-RAG (Control A)"] = (acc, excluded, n, breakdown)
 
         print("[RUNNING] Evaluating Control Group B: Unbounded GraphRAG (max_edges = inf)...")
-        acc, excluded, n = self.evaluate_graph_engine(max_edges=float('inf'))
-        results["Unbounded GraphRAG (Control B)"] = (acc, excluded, n)
+        acc, excluded, n, breakdown = self.evaluate_graph_engine(max_edges=float('inf'))
+        results["Unbounded GraphRAG (Control B)"] = (acc, excluded, n, breakdown)
 
         print("[RUNNING] Executing Parameter Sweep for Bounded GraphRAG...")
         for edges in range(2, 11):
-            acc, excluded, n = self.evaluate_graph_engine(max_edges=edges)
-            results[f"Bounded GraphRAG (max_edges={edges})"] = (acc, excluded, n)
+            acc, excluded, n, breakdown = self.evaluate_graph_engine(max_edges=edges)
+            results[f"Bounded GraphRAG (max_edges={edges})"] = (acc, excluded, n, breakdown)
             excl_note = f" (excluded {excluded} invalid data points)" if excluded else ""
             print(f" -> Configuration max_edges={edges} | Accuracy: {acc:.2f}% over {n} valid queries{excl_note}")
 
         print("\n" + "=" * 65)
         print("FINAL HYPERPARAMETER SWEEP METRICS")
         print("=" * 65)
-        for config, (acc, excluded, n) in results.items():
+        for config, (acc, excluded, n, breakdown) in results.items():
             acc_str = f"{acc:.2f}%" if n > 0 else "N/A (no valid data)"
             excl_note = f"  [excluded {excluded}]" if excluded else ""
             print(f"{config:<35}: {acc_str:<20} n={n}{excl_note}")
+
+        print("\n" + "=" * 65)
+        print("ACCURACY BY QUERY TYPE")
+        print("=" * 65)
+        all_types = sorted({t for r in results.values() for t in r[3].keys()})
+        header = f"{'Configuration':<35}" + "".join(f"{t:<24}" for t in all_types)
+        print(header)
+        for config, (acc, excluded, n, breakdown) in results.items():
+            row = f"{config:<35}"
+            for t in all_types:
+                if t in breakdown:
+                    t_acc, t_excl, t_n = breakdown[t]
+                    cell = f"{t_acc:.0f}% (n={t_n})" if t_n > 0 else "N/A"
+                else:
+                    cell = "-"
+                row += f"{cell:<24}"
+            print(row)
 
 
 if __name__ == "__main__":

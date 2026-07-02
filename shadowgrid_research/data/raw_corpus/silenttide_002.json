@@ -1,0 +1,5 @@
+{
+    "timestamp": "2026-02-25T09:00:00",
+    "doc_id": "silenttide_002",
+    "content": "Agent Ivo introduces Concept Sparse-Retrieval to SilentTide. The system utilizes HuggingFace models for embedding computation. Asset MySQL handles metadata storage."
+}

@@ -1,18 +1,222 @@
 [
     {
-        "query": "Who was the initial engineer for ShadowGrid?",
-        "ground_truth": "Agent Alexander",
+        "query_id": "ShadowGrid_Q_temporal_drift",
+        "type": "temporal_drift",
+        "query": "What is the current active database stack utilized by Project ShadowGrid?",
+        "ground_truth": "Asset Pinecone. The system was originally on MongoDB but completed a migration to Pinecone, fully decommissioning MongoDB.",
         "target_entities": [
             "ShadowGrid",
+            "MongoDB",
+            "Pinecone"
+        ]
+    },
+    {
+        "query_id": "ShadowGrid_Q_multi_hop_contradiction",
+        "type": "multi_hop_contradiction",
+        "query": "Who is the primary engineering contact for the project that utilizes Asset Pinecone?",
+        "ground_truth": "Agent Alexander. ShadowGrid uses Pinecone, and while Bianca was the original lead, they were removed and Alexander is now the sole primary contact.",
+        "target_entities": [
+            "ShadowGrid",
+            "Pinecone",
+            "Bianca",
             "Alexander"
         ]
     },
     {
-        "query": "What database platform did ShadowGrid migrate to?",
-        "ground_truth": "Qdrant",
+        "query_id": "ShadowGrid_Q_multi_hop_concept",
+        "type": "multi_hop",
+        "query": "Which algorithmic concept was introduced to the project managed by Agent Alexander?",
+        "ground_truth": "Concept Sparse-Retrieval. It was introduced to Project ShadowGrid, which is now managed by Agent Alexander.",
+        "target_entities": [
+            "Alexander",
+            "ShadowGrid",
+            "Sparse-Retrieval"
+        ]
+    },
+    {
+        "query_id": "ShadowGrid_Q_entity_lookup",
+        "type": "entity_lookup",
+        "query": "Who was the initial engineer for Project ShadowGrid?",
+        "ground_truth": "Agent Bianca.",
         "target_entities": [
             "ShadowGrid",
+            "Bianca"
+        ]
+    },
+    {
+        "query_id": "IronVault_Q_temporal_drift",
+        "type": "temporal_drift",
+        "query": "What is the current active database stack utilized by Project IronVault?",
+        "ground_truth": "Asset Weaviate. The system was originally on MongoDB but completed a migration to Weaviate, fully decommissioning MongoDB.",
+        "target_entities": [
+            "IronVault",
+            "MongoDB",
+            "Weaviate"
+        ]
+    },
+    {
+        "query_id": "IronVault_Q_multi_hop_contradiction",
+        "type": "multi_hop_contradiction",
+        "query": "Who is the primary engineering contact for the project that utilizes Asset Weaviate?",
+        "ground_truth": "Agent Ivo. IronVault uses Weaviate, and while Bianca was the original lead, they were removed and Ivo is now the sole primary contact.",
+        "target_entities": [
+            "IronVault",
+            "Weaviate",
+            "Bianca",
+            "Ivo"
+        ]
+    },
+    {
+        "query_id": "IronVault_Q_multi_hop_concept",
+        "type": "multi_hop",
+        "query": "Which algorithmic concept was introduced to the project managed by Agent Ivo?",
+        "ground_truth": "Concept Vector-Embeddings. It was introduced to Project IronVault, which is now managed by Agent Ivo.",
+        "target_entities": [
+            "Ivo",
+            "IronVault",
+            "Vector-Embeddings"
+        ]
+    },
+    {
+        "query_id": "IronVault_Q_entity_lookup",
+        "type": "entity_lookup",
+        "query": "Who was the initial engineer for Project IronVault?",
+        "ground_truth": "Agent Bianca.",
+        "target_entities": [
+            "IronVault",
+            "Bianca"
+        ]
+    },
+    {
+        "query_id": "NightOwl_Q_temporal_drift",
+        "type": "temporal_drift",
+        "query": "What is the current active database stack utilized by Project NightOwl?",
+        "ground_truth": "Asset Qdrant. The system was originally on PostgreSQL but completed a migration to Qdrant, fully decommissioning PostgreSQL.",
+        "target_entities": [
+            "NightOwl",
+            "PostgreSQL",
             "Qdrant"
+        ]
+    },
+    {
+        "query_id": "NightOwl_Q_multi_hop_contradiction",
+        "type": "multi_hop_contradiction",
+        "query": "Who is the primary engineering contact for the project that utilizes Asset Qdrant?",
+        "ground_truth": "Agent Bianca. NightOwl uses Qdrant, and while Alexander was the original lead, they were removed and Bianca is now the sole primary contact.",
+        "target_entities": [
+            "NightOwl",
+            "Qdrant",
+            "Alexander",
+            "Bianca"
+        ]
+    },
+    {
+        "query_id": "NightOwl_Q_multi_hop_concept",
+        "type": "multi_hop",
+        "query": "Which algorithmic concept was introduced to the project managed by Agent Bianca?",
+        "ground_truth": "Concept Vector-Embeddings. It was introduced to Project NightOwl, which is now managed by Agent Bianca.",
+        "target_entities": [
+            "Bianca",
+            "NightOwl",
+            "Vector-Embeddings"
+        ]
+    },
+    {
+        "query_id": "NightOwl_Q_entity_lookup",
+        "type": "entity_lookup",
+        "query": "Who was the initial engineer for Project NightOwl?",
+        "ground_truth": "Agent Alexander.",
+        "target_entities": [
+            "NightOwl",
+            "Alexander"
+        ]
+    },
+    {
+        "query_id": "CobaltMesh_Q_temporal_drift",
+        "type": "temporal_drift",
+        "query": "What is the current active database stack utilized by Project CobaltMesh?",
+        "ground_truth": "Asset Weaviate. The system was originally on MySQL but completed a migration to Weaviate, fully decommissioning MySQL.",
+        "target_entities": [
+            "CobaltMesh",
+            "MySQL",
+            "Weaviate"
+        ]
+    },
+    {
+        "query_id": "CobaltMesh_Q_multi_hop_contradiction",
+        "type": "multi_hop_contradiction",
+        "query": "Who is the primary engineering contact for the project that utilizes Asset Weaviate?",
+        "ground_truth": "Agent Bianca. CobaltMesh uses Weaviate, and while Ivo was the original lead, they were removed and Bianca is now the sole primary contact.",
+        "target_entities": [
+            "CobaltMesh",
+            "Weaviate",
+            "Ivo",
+            "Bianca"
+        ]
+    },
+    {
+        "query_id": "CobaltMesh_Q_multi_hop_concept",
+        "type": "multi_hop",
+        "query": "Which algorithmic concept was introduced to the project managed by Agent Bianca?",
+        "ground_truth": "Concept Cross-Encoder-Rerank. It was introduced to Project CobaltMesh, which is now managed by Agent Bianca.",
+        "target_entities": [
+            "Bianca",
+            "CobaltMesh",
+            "Cross-Encoder-Rerank"
+        ]
+    },
+    {
+        "query_id": "CobaltMesh_Q_entity_lookup",
+        "type": "entity_lookup",
+        "query": "Who was the initial engineer for Project CobaltMesh?",
+        "ground_truth": "Agent Ivo.",
+        "target_entities": [
+            "CobaltMesh",
+            "Ivo"
+        ]
+    },
+    {
+        "query_id": "SilentTide_Q_temporal_drift",
+        "type": "temporal_drift",
+        "query": "What is the current active database stack utilized by Project SilentTide?",
+        "ground_truth": "Asset Qdrant. The system was originally on MySQL but completed a migration to Qdrant, fully decommissioning MySQL.",
+        "target_entities": [
+            "SilentTide",
+            "MySQL",
+            "Qdrant"
+        ]
+    },
+    {
+        "query_id": "SilentTide_Q_multi_hop_contradiction",
+        "type": "multi_hop_contradiction",
+        "query": "Who is the primary engineering contact for the project that utilizes Asset Qdrant?",
+        "ground_truth": "Agent Desmond. SilentTide uses Qdrant, and while Ivo was the original lead, they were removed and Desmond is now the sole primary contact.",
+        "target_entities": [
+            "SilentTide",
+            "Qdrant",
+            "Ivo",
+            "Desmond"
+        ]
+    },
+    {
+        "query_id": "SilentTide_Q_multi_hop_concept",
+        "type": "multi_hop",
+        "query": "Which algorithmic concept was introduced to the project managed by Agent Desmond?",
+        "ground_truth": "Concept Sparse-Retrieval. It was introduced to Project SilentTide, which is now managed by Agent Desmond.",
+        "target_entities": [
+            "Desmond",
+            "SilentTide",
+            "Sparse-Retrieval"
+        ]
+    },
+    {
+        "query_id": "SilentTide_Q_entity_lookup",
+        "type": "entity_lookup",
+        "query": "Who was the initial engineer for Project SilentTide?",
+        "ground_truth": "Agent Ivo.",
+        "target_entities": [
+            "SilentTide",
+            "Ivo"
         ]
     }
 ]

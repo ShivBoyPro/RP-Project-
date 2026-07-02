@@ -1,0 +1,5 @@
+{
+    "timestamp": "2026-04-06T09:00:00",
+    "doc_id": "cobaltmesh_003",
+    "content": "CRITICAL INFRASTRUCTURE UPDATE: Project CobaltMesh completely migrates away from MySQL. Asset MySQL is fully decommissioned. The current database stack for CobaltMesh is now completely transitioned to Asset Weaviate for vector and metadata handling."
+}

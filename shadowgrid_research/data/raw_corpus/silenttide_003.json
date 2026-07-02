@@ -1,0 +1,5 @@
+{
+    "timestamp": "2026-03-27T09:00:00",
+    "doc_id": "silenttide_003",
+    "content": "CRITICAL INFRASTRUCTURE UPDATE: Project SilentTide completely migrates away from MySQL. Asset MySQL is fully decommissioned. The current database stack for SilentTide is now completely transitioned to Asset Qdrant for vector and metadata handling."
+}

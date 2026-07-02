@@ -1,0 +1,5 @@
+{
+    "timestamp": "2026-02-09T09:00:00",
+    "doc_id": "ironvault_002",
+    "content": "Agent Bianca introduces Concept Vector-Embeddings to IronVault. The system utilizes HuggingFace models for embedding computation. Asset MongoDB handles metadata storage."
+}
