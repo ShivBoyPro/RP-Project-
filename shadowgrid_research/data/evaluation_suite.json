@@ -1,0 +1,18 @@
+[
+    {
+        "query": "Who was the initial engineer for ShadowGrid?",
+        "ground_truth": "Agent Alexander",
+        "target_entities": [
+            "ShadowGrid",
+            "Alexander"
+        ]
+    },
+    {
+        "query": "What database platform did ShadowGrid migrate to?",
+        "ground_truth": "Qdrant",
+        "target_entities": [
+            "ShadowGrid",
+            "Qdrant"
+        ]
+    }
+]
