@@ -2,6 +2,7 @@ import hashlib
 import heapq
 import math
 from collections import defaultdict
+from datetime import datetime
 
 class BoundedChunkStore:
     def __init__(self, max_chunks=5000):
@@ -33,19 +34,18 @@ class BoundedChunkStore:
     def get_context(self, src, tgt):
         chunk_ids = self.edge_to_chunks.get((src, tgt), set())
         return [self.chunks[cid] for cid in chunk_ids if cid in self.chunks]
-        
-import hashlib
-import heapq
-import math
-from collections import defaultdict
+
 
 class BoundedGraphRAGEngine:
     def __init__(self, max_edges=1000):
         self.max_edges = max_edges
         self.node_degrees = defaultdict(int)
-        self.adjacency = defaultdict(set)  # Required for O(1) neighborhood resolution
+        self.adjacency = defaultdict(set)  # O(1) neighborhood resolution
         self.edges = {}  # (src, tgt) -> true_current_entropy
         self.eviction_heap = [] 
+        
+        # TIER 2 MEMORY: Cold Storage Archive
+        self.archive = [] 
         
     def _compute_local_edge_entropy(self, src, tgt):
         deg_src = self.node_degrees.get(src, 1)
@@ -66,7 +66,7 @@ class BoundedGraphRAGEngine:
                     del self.adjacency[node]
 
     def _update_and_push(self, src, tgt):
-        """Calculates current entropy and pushes to heap. Leaves stale duplicates in heap to be lazy-deleted."""
+        """Calculates current entropy and pushes to heap. Leaves stale duplicates to be lazy-deleted."""
         entropy = self._compute_local_edge_entropy(src, tgt)
         self.edges[(src, tgt)] = entropy
         heapq.heappush(self.eviction_heap, (-entropy, src, tgt))
@@ -85,38 +85,53 @@ class BoundedGraphRAGEngine:
         self._update_and_push(src, tgt)
         
         # 3. Localized Topological Recalculation O(D)
-        # Prevents the heap from decaying into temporal staleness
         for node in (src, tgt):
             for neighbor in self.adjacency[node]:
-                if neighbor == tgt and node == src: continue
+                if neighbor == tgt and node == src: 
+                    continue
                 e = (node, neighbor) if (node, neighbor) in self.edges else (neighbor, node)
                 if e in self.edges:
                     self._update_and_push(e[0], e[1])
 
-        # 4. Lazy-Evaluation Eviction Loop
+        # 4. Lazy-Evaluation Eviction Loop with Tiered Handshake
         while len(self.edges) > self.max_edges:
             neg_entropy, victim_src, victim_tgt = heapq.heappop(self.eviction_heap)
             
-            # STALE CHECK: If the heap value doesn't match the true current value, it's a ghost entry. Burn it.
+            # STALE CHECK: Verify if heap record matches true current mapping
             current_true_entropy = self.edges.get((victim_src, victim_tgt))
             if current_true_entropy is None or neg_entropy != -current_true_entropy:
                 continue 
             
-            # Execute Eviction
+            # TIERED MEMORY SHIFT: Archive before deleting from Tier 1 Cache
+            self.archive.append({
+                "src": victim_src,
+                "tgt": victim_tgt,
+                "entropy_at_eviction": current_true_entropy,
+                "timestamp": datetime.now().isoformat()
+            })
+            
+            # Execute Eviction from Tier 1
             del self.edges[(victim_src, victim_tgt)]
             self.adjacency[victim_src].discard(victim_tgt)
             self.adjacency[victim_tgt].discard(victim_src)
             self._garbage_collect_nodes(victim_src, victim_tgt)
 
     def retrieve_subgraph_context(self, target_entities, chunk_store):
-        valid_targets = set(target_entities) & set(self.node_degrees.keys())
-        if not valid_targets:
-            return ""
-
         matched_contexts = []
-        for (src, tgt) in self.edges.keys():
-            if src in valid_targets or tgt in valid_targets:
-                for text in chunk_store.get_context(src, tgt):
-                    matched_contexts.append(text)
+        target_set = set(target_entities)
+        
+        # --- TIER 1: ACTIVE GRAPH RETRIEVAL (Fast O(1) Memory Edge Match) ---
+        valid_active_targets = target_set & set(self.node_degrees.keys())
+        if valid_active_targets:
+            for (src, tgt) in self.edges.keys():
+                if src in valid_active_targets or tgt in valid_active_targets:
+                    for text in chunk_store.get_context(src, tgt):
+                        matched_contexts.append(f"[TIER 1 ACTIVE] {text}")
+        
+        # --- TIER 2: ARCHIVE RETRIEVAL (Sequential Fallback Scan) ---
+        for archived_edge in self.archive:
+            if archived_edge["src"] in target_set or archived_edge["tgt"] in target_set:
+                for text in chunk_store.get_context(archived_edge["src"], archived_edge["tgt"]):
+                    matched_contexts.append(f"[TIER 2 ARCHIVE] {text}")
                 
         return "\n".join(set(matched_contexts))

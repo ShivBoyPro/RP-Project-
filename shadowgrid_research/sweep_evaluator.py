@@ -172,14 +172,28 @@ GRADE: <1 or 0>
         return None
 
     @staticmethod
+    def _parse_tier_usage(context):
+        """
+        Parses the [TIER 1 ACTIVE] / [TIER 2 ARCHIVE] telemetry tags that
+        BoundedGraphRAGEngine.retrieve_subgraph_context prefixes onto each
+        matched text chunk. A "hit" means at least one chunk from that tier
+        made it into the context handed to the LLM for this query.
+        """
+        tier1_hit = "[TIER 1 ACTIVE]" in context
+        tier2_hit = "[TIER 2 ARCHIVE]" in context
+        return tier1_hit, tier2_hit
+
+    @staticmethod
     def _score_summary(records):
         """
-        records: list of dicts {query_id, type, score} where score is
-        1, 0, or None (excluded - infra/parsing failure, not a wrong answer).
-        Returns overall accuracy/excluded/n plus a per-query-type breakdown,
-        so failures that cluster in one query type (e.g.
-        multi_hop_contradiction, which requires resolving cross-project
-        ambiguity) are visible instead of averaged away into one number.
+        records: list of dicts {query_id, type, score, tier1_hit, tier2_hit}
+        where score is 1, 0, or None (excluded - infra/parsing failure, not
+        a wrong answer) and tier1_hit/tier2_hit are None for non-graph
+        (Vector-RAG) evaluations.
+
+        Returns overall accuracy/excluded/n, a per-query-type breakdown,
+        and Tier 1 / Tier 2 hit ratios computed over valid (non-excluded)
+        queries - matching the same denominator convention as accuracy.
         """
         valid = [r for r in records if r["score"] is not None]
         excluded = len(records) - len(valid)
@@ -196,7 +210,15 @@ GRADE: <1 or 0>
             acc_t = (sum(valid_t) / len(valid_t) * 100) if valid_t else float("nan")
             type_breakdown[qtype] = (acc_t, excl_t, len(valid_t))
 
-        return accuracy, excluded, len(valid), type_breakdown
+        tier_records = [r for r in valid if r.get("tier1_hit") is not None]
+        if tier_records:
+            tier1_ratio = sum(1 for r in tier_records if r["tier1_hit"]) / len(tier_records) * 100
+            tier2_ratio = sum(1 for r in tier_records if r["tier2_hit"]) / len(tier_records) * 100
+        else:
+            tier1_ratio = None
+            tier2_ratio = None
+
+        return accuracy, excluded, len(valid), type_breakdown, tier1_ratio, tier2_ratio
 
     def evaluate_vector_baseline(self):
         vector_engine = VectorRAGEngine()
@@ -220,7 +242,10 @@ GRADE: <1 or 0>
             print(f"[LLM OUTPUT]: {output}")
 
             score = self.verify_accuracy_with_judge(q['query'], q['ground_truth'], output, query_id=qid)
-            records.append({"query_id": qid, "type": qtype, "score": score})
+            # Vector-RAG has no tiered memory - tier fields stay None so
+            # they're excluded from tier-ratio calculations downstream.
+            records.append({"query_id": qid, "type": qtype, "score": score,
+                             "tier1_hit": None, "tier2_hit": None})
 
         return self._score_summary(records)
 
@@ -230,7 +255,8 @@ GRADE: <1 or 0>
         self.ingest_corpus(graph_engine, chunk_store)
 
         print(f"[SUCCESS] Streaming ingestion complete. Active Graph State: "
-              f"Nodes={len(graph_engine.node_degrees)}, Edges={len(graph_engine.edges)}")
+              f"Nodes={len(graph_engine.node_degrees)}, Edges={len(graph_engine.edges)}, "
+              f"Archived Edges={len(graph_engine.archive)}")
 
         records = []
 
@@ -240,9 +266,10 @@ GRADE: <1 or 0>
             qtype = q.get("type", "unknown")
 
             context = graph_engine.retrieve_subgraph_context(q['target_entities'], chunk_store)
+            tier1_hit, tier2_hit = self._parse_tier_usage(context)
 
             print(f"\n[DIAGNOSTIC] Query: {q['query']} [id={qid}, type={qtype}]")
-            print(f"--- RAW GRAPH CONTEXT SURFACE ---")
+            print(f"--- RAW GRAPH CONTEXT SURFACE (Tier1={tier1_hit}, Tier2={tier2_hit}) ---")
             print(context if context.strip() else "[EMPTY CONTEXT]")
             print(f"---------------------------------")
 
@@ -251,7 +278,8 @@ GRADE: <1 or 0>
             print(f"[LLM OUTPUT]: {output}")
 
             score = self.verify_accuracy_with_judge(q['query'], q['ground_truth'], output, query_id=qid)
-            records.append({"query_id": qid, "type": qtype, "score": score})
+            records.append({"query_id": qid, "type": qtype, "score": score,
+                             "tier1_hit": tier1_hit, "tier2_hit": tier2_hit})
 
         return self._score_summary(records)
 
@@ -259,24 +287,25 @@ GRADE: <1 or 0>
         results = {}
 
         print("[RUNNING] Evaluating Control Group A: Baseline Vector-RAG...")
-        acc, excluded, n, breakdown = self.evaluate_vector_baseline()
-        results["Vector-RAG (Control A)"] = (acc, excluded, n, breakdown)
+        acc, excluded, n, breakdown, t1, t2 = self.evaluate_vector_baseline()
+        results["Vector-RAG (Control A)"] = (acc, excluded, n, breakdown, t1, t2)
 
         print("[RUNNING] Evaluating Control Group B: Unbounded GraphRAG (max_edges = inf)...")
-        acc, excluded, n, breakdown = self.evaluate_graph_engine(max_edges=float('inf'))
-        results["Unbounded GraphRAG (Control B)"] = (acc, excluded, n, breakdown)
+        acc, excluded, n, breakdown, t1, t2 = self.evaluate_graph_engine(max_edges=float('inf'))
+        results["Unbounded GraphRAG (Control B)"] = (acc, excluded, n, breakdown, t1, t2)
 
         print("[RUNNING] Executing Parameter Sweep for Bounded GraphRAG...")
         for edges in range(2, 11):
-            acc, excluded, n, breakdown = self.evaluate_graph_engine(max_edges=edges)
-            results[f"Bounded GraphRAG (max_edges={edges})"] = (acc, excluded, n, breakdown)
+            acc, excluded, n, breakdown, t1, t2 = self.evaluate_graph_engine(max_edges=edges)
+            results[f"Bounded GraphRAG (max_edges={edges})"] = (acc, excluded, n, breakdown, t1, t2)
             excl_note = f" (excluded {excluded} invalid data points)" if excluded else ""
-            print(f" -> Configuration max_edges={edges} | Accuracy: {acc:.2f}% over {n} valid queries{excl_note}")
+            tier_note = f" | Tier1 Hit: {t1:.1f}% | Tier2 Hit: {t2:.1f}%" if t1 is not None else ""
+            print(f" -> Configuration max_edges={edges} | Accuracy: {acc:.2f}% over {n} valid queries{excl_note}{tier_note}")
 
         print("\n" + "=" * 65)
         print("FINAL HYPERPARAMETER SWEEP METRICS")
         print("=" * 65)
-        for config, (acc, excluded, n, breakdown) in results.items():
+        for config, (acc, excluded, n, breakdown, t1, t2) in results.items():
             acc_str = f"{acc:.2f}%" if n > 0 else "N/A (no valid data)"
             excl_note = f"  [excluded {excluded}]" if excluded else ""
             print(f"{config:<35}: {acc_str:<20} n={n}{excl_note}")
@@ -287,7 +316,7 @@ GRADE: <1 or 0>
         all_types = sorted({t for r in results.values() for t in r[3].keys()})
         header = f"{'Configuration':<35}" + "".join(f"{t:<24}" for t in all_types)
         print(header)
-        for config, (acc, excluded, n, breakdown) in results.items():
+        for config, (acc, excluded, n, breakdown, t1, t2) in results.items():
             row = f"{config:<35}"
             for t in all_types:
                 if t in breakdown:
@@ -297,6 +326,18 @@ GRADE: <1 or 0>
                     cell = "-"
                 row += f"{cell:<24}"
             print(row)
+
+        # Tier utilization is only meaningful for the graph configurations;
+        # Vector-RAG has no tiered memory and is intentionally omitted here
+        # rather than printed as a misleading "0%".
+        print("\n" + "=" * 65)
+        print("MEMORY TIER UTILIZATION (Tier 1 Active vs Tier 2 Archive)")
+        print("=" * 65)
+        print(f"{'Configuration':<35}{'Tier 1 Hit Ratio':<20}{'Tier 2 Hit Ratio':<20}")
+        for config, (acc, excluded, n, breakdown, t1, t2) in results.items():
+            if t1 is None:
+                continue
+            print(f"{config:<35}{t1:>6.1f}%{'':<13}{t2:>6.1f}%")
 
 
 if __name__ == "__main__":
