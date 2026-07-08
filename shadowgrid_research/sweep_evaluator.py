@@ -258,6 +258,17 @@ GRADE: <1 or 0>
               f"Nodes={len(graph_engine.node_degrees)}, Edges={len(graph_engine.edges)}, "
               f"Archived Edges={len(graph_engine.archive)}")
 
+        archived_pairs = [(a["src"], a["tgt"]) for a in graph_engine.archive]
+        unique_archived_pairs = set(archived_pairs)
+        overlapping_with_active = sum(
+            1 for (s, t) in unique_archived_pairs
+            if (s, t) in graph_engine.edges or (t, s) in graph_engine.edges
+        )
+        print(f"[ARCHIVE DIAGNOSTIC] {len(archived_pairs)} raw records, "
+              f"{len(unique_archived_pairs)} unique pairs, "
+              f"{overlapping_with_active} still overlapping with active Tier 1 "
+              f"(should be 0 after the reinsert-purge fix)")
+
         records = []
 
         print(f"\n=== STARTING GRAPH RAG EVALUATION (max_edges={max_edges}) ===")
