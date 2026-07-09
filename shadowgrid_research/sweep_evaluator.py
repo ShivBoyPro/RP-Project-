@@ -1,8 +1,8 @@
+import hashlib
 import json
 import os
 import re
 import time
-import itertools
 import urllib.request
 import urllib.error
 import ssl
@@ -24,7 +24,10 @@ class SweepEvaluator:
 
         self.queries = self.load_evaluation_suite()
         self.corpus = self.load_corpus()
-        self.entity_vocab = self.build_entity_vocab()
+        # Keyed by sha256(doc content) -> list of (src, tgt) relation tuples.
+        # Populated once per document on first extraction and reused across
+        # every configuration in the sweep - see get_relations_for_doc.
+        self.relation_cache = {}
 
     def load_evaluation_suite(self):
         if not os.path.exists(self.eval_suite_path):
@@ -44,51 +47,88 @@ class SweepEvaluator:
         with open(self.corpus_path, "r") as f:
             return json.load(f)
 
-    def build_entity_vocab(self):
+    def extract_relations_streaming(self, chunk_text, max_retries=5):
         """
-        Entity vocabulary is derived from target_entities across the eval
-        suite rather than hardcoded, so ingestion tracks whatever entities
-        the eval suite actually cares about, without needing to be edited
-        every time queries/entities change.
+        LLM-based relation extraction. Prompt/schema is identical to
+        generator.py's extract_relations_streaming so ingestion here
+        produces the same kind of edges the corpus was designed around,
+        rather than a deterministic stand-in built from the eval suite's
+        own target_entities (which let the graph "know" the answer to a
+        query before any extraction ever ran).
         """
-        vocab = set()
-        for q in self.queries:
-            vocab.update(q.get("target_entities", []))
-        # Longer names first, so e.g. "Verification-Run-1" is matched whole
-        # rather than accidentally short-circuited by a shorter substring.
-        return sorted(vocab, key=len, reverse=True)
+        prompt = f"""
+Analyze the text and extract direct relationships between technical entities.
+Output ONLY a JSON object with a single key "relations" containing an array of pairs.
+Format: {{"relations": [["EntityA", "EntityB"]]}}
+Do not invent relationships. Ignore generic nouns.
 
-    def extract_pairs_from_doc(self, text):
+Text: {chunk_text}
+"""
+        response = self.query_cloud_llm(prompt, max_retries=max_retries, json_mode=True)
+
+        if response.startswith("ERROR"):
+            print(f"[EXTRACTION DROPPED] LLM call failed: {response}")
+            return []
+
+        try:
+            parsed = json.loads(response)
+        except json.JSONDecodeError as e:
+            print(f"[EXTRACTION DROPPED] Non-JSON response ({e}): {response[:200]}")
+            return []
+
+        valid_relations = []
+        for pair in parsed.get("relations", []):
+            if isinstance(pair, list) and len(pair) == 2:
+                valid_relations.append(tuple(pair))
+        return valid_relations
+
+    def get_relations_for_doc(self, text, max_retries=5):
         """
-        Deterministic co-occurrence extraction: find every known entity that
-        appears in this document's text, then link every pair of them. This
-        reproduces the pattern seen in prior real ingestion logs (e.g.
-        ('Bianca', 'Verification-Run-1') appearing without 'ShadowGrid'
-        present in the same edge) - i.e. genuine pairwise co-occurrence,
-        not a hub-and-spoke model centered on one entity.
+        Content-hash-keyed cache in front of extract_relations_streaming.
+        Without this, execute_sweep would re-run extraction on every one of
+        ~13 configurations (11 of which call ingest_corpus), i.e.
+        len(corpus) x 11 LLM calls for identical input text. Caching by
+        doc-content hash means each document is extracted exactly once for
+        the whole sweep: it cuts API cost roughly 11x, and - just as
+        important - it guarantees every configuration ingests the exact
+        same graph topology, so accuracy differences across max_edges
+        reflect the bounding/retrieval logic being swept, not extraction
+        nondeterminism or a dropped call in one run and not another.
         """
-        present = [e for e in self.entity_vocab if e in text]
-        pairs = []
-        for src, tgt in itertools.combinations(sorted(set(present)), 2):
-            pairs.append((src, tgt))
-        return pairs
+        doc_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if doc_hash in self.relation_cache:
+            return self.relation_cache[doc_hash]
+
+        relations = self.extract_relations_streaming(text, max_retries=max_retries)
+        self.relation_cache[doc_hash] = relations
+        return relations
 
     def ingest_corpus(self, graph_engine, chunk_store):
+        zero_relation_docs = []
         for doc in self.corpus:
             text = doc.get("content", "")
             if not text:
                 continue
-            for src, tgt in self.extract_pairs_from_doc(text):
+            relations = self.get_relations_for_doc(text)
+            if not relations:
+                zero_relation_docs.append(doc.get("doc_id", "?"))
+            for src, tgt in relations:
                 graph_engine.insert_edge(src, tgt)
                 chunk_store.add_extraction(src, tgt, text)
 
-    def query_cloud_llm(self, prompt, max_retries=5):
+        if zero_relation_docs:
+            print(f"[EXTRACTION SUMMARY] {len(zero_relation_docs)}/{len(self.corpus)} "
+                  f"docs produced zero relations: {zero_relation_docs}")
+
+    def query_cloud_llm(self, prompt, max_retries=5, json_mode=False):
         url = "https://api.groq.com/openai/v1/chat/completions"
         data = {
             "model": self.cloud_model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.0
         }
+        if json_mode:
+            data["response_format"] = {"type": "json_object"}
         payload = json.dumps(data).encode("utf-8")
         headers = {
             "Content-Type": "application/json",
