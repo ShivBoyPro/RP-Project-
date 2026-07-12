@@ -220,22 +220,60 @@ class StreamingDatasetGenerator:
               f"({self.num_projects} projects x 4 query types) at {self.eval_file}")
 
 
-client = Groq()  # Fails immediately if GROQ_API_KEY env var is missing
+_client = None
 
 
-def extract_relations_streaming(chunk_text, max_retries=5):
+def _get_client():
+    """Lazily instantiate the Groq client on first use, rather than at
+    module import time. Instantiating at import time meant GROQ_API_KEY had
+    to already be bound in the environment before this module could even be
+    imported - breaking test suites, deployment runners, or any script that
+    sets up env vars after import."""
+    global _client
+    if _client is None:
+        _client = Groq()
+    return _client
+
+
+# Operational prefixes that appear in source text but should not survive
+# into the graph as part of the entity name, or "Project ShadowGrid" and
+# "ShadowGrid" fracture into two distinct nodes even though every downstream
+# query and ground_truth string uses the bare form.
+ENTITY_PREFIX_PATTERN = re.compile(r"^(Project|Asset|Agent|Concept|Event)\s+", re.IGNORECASE)
+
+
+def normalize_entity(name):
+    """Strip known operational prefixes and surrounding whitespace so
+    variant surface forms of the same entity collapse onto one node."""
+    if not isinstance(name, str):
+        return name
+    return ENTITY_PREFIX_PATTERN.sub("", name).strip()
+
+
+def extract_relations_streaming(chunk_text, max_retries=5, client=None):
     """
     Extracts entity relation pairs via Groq. Includes 429 retry/backoff -
     at 50 docs, sequential extraction calls will hit the TPM rate limit
     partway through; without backoff, later documents in the corpus would
     silently contribute zero edges (extraction "dropped"), skewing the
     graph toward whichever projects happened to be ingested first.
+
+    `client` can be passed explicitly (e.g. from a test harness); otherwise
+    a lazily-initialized module-level client is used.
     """
+    if client is None:
+        client = _get_client()
+
     prompt = f"""
 Analyze the text and extract direct relationships between technical entities.
 Output ONLY a JSON object with a single key "relations" containing an array of pairs.
 Format: {{"relations": [["EntityA", "EntityB"]]}}
 Do not invent relationships. Ignore generic nouns.
+
+Strip operational prefixes from entity names before returning them: do not
+include the words "Project", "Asset", "Agent", "Concept", or "Event" as part
+of an entity name. For example, return "ShadowGrid" instead of "Project
+ShadowGrid", and "Alexander" instead of "Agent Alexander".
 
 Text: {chunk_text}
 """
@@ -254,13 +292,17 @@ Text: {chunk_text}
             valid_relations = []
             for pair in parsed.get("relations", []):
                 if isinstance(pair, list) and len(pair) == 2:
-                    valid_relations.append(tuple(pair))
+                    src, tgt = normalize_entity(pair[0]), normalize_entity(pair[1])
+                    if src and tgt:
+                        valid_relations.append((src, tgt))
 
             return valid_relations
 
         except Exception as e:
             body = str(e)
             last_error = body
+
+            # Rate limiting: honor the server's requested backoff if given.
             match = re.search(r"try again in ([\d.]+)s", body)
             if match:
                 wait = float(match.group(1)) + 0.5
@@ -272,7 +314,31 @@ Text: {chunk_text}
                 print(f"[RATE LIMIT] backing off {wait:.2f}s (attempt {attempt + 1}/{max_retries})")
                 time.sleep(wait)
                 continue
-            # Non-rate-limit failure - not retryable
+
+            # Transient connectivity/server-side failures: dropped packets,
+            # DNS blips, connection resets, timeouts, or a 502/503 from the
+            # gateway. These are not evidence the request itself is bad, so
+            # retry with backoff rather than silently discarding the
+            # document's edges (which would corrupt the graph's structural
+            # footprint based purely on infrastructure flakiness).
+            is_transient = isinstance(e, (
+                ConnectionError, TimeoutError, OSError,
+            )) or any(
+                marker in body
+                for marker in (
+                    "Connection", "connection", "timeout", "Timeout",
+                    "502", "503", "504", "Bad Gateway", "Service Unavailable",
+                    "Gateway Timeout", "Temporary failure", "reset by peer",
+                )
+            )
+            if is_transient:
+                wait = 2 ** attempt
+                print(f"[TRANSIENT ERROR] backing off {wait:.2f}s (attempt {attempt + 1}/{max_retries}): {e}")
+                time.sleep(wait)
+                continue
+
+            # Non-retryable failure (e.g. malformed request, auth error,
+            # unparseable response schema): retrying won't help.
             print(f"[EXTRACTION DROPPED] Model failure: {e}")
             return []
 
@@ -285,43 +351,49 @@ def run_pipeline(num_projects=5, noise_docs=25):
     generator.generate_streaming_corpus()
     generator.generate_evaluation_suite()
 
-    corpus_dir = "data/raw_corpus"
-    if not os.path.exists(corpus_dir):
-        print(f"Corpus directory {corpus_dir} not found.")
+    corpus_path = "data/corpus.json"
+    if not os.path.exists(corpus_path):
+        print(f"Corpus file {corpus_path} not found.")
         return
 
     chunk_store = BoundedChunkStore(max_chunks=2000)
     engine = BoundedGraphRAGEngine(max_edges=1000)
 
-    files = sorted([f for f in os.listdir(corpus_dir) if f.endswith(".json")])
+    # Read the monolithic corpus rather than listing raw_corpus/ alphabetically.
+    # Filenames are prefixed by project (e.g. cobaltmesh_001.json), so an
+    # alphabetical directory listing would process each project's documents
+    # as one contiguous block, defeating the interleaved timeline the
+    # generator staggered on purpose. corpus.json preserves true
+    # chronological (timestamp-sorted) order.
+    with open(corpus_path, "r") as f:
+        docs = json.load(f)
+
     docs_with_zero_relations = []
 
-    for idx, filename in enumerate(files, 1):
-        with open(os.path.join(corpus_dir, filename), "r") as f:
-            doc = json.load(f)
-
+    for idx, doc in enumerate(docs, 1):
         raw_text = doc.get("content", "")
 
         relations = extract_relations_streaming(raw_text)
 
-        print(f"[EXTRACTION] doc={doc.get('doc_id', filename)} -> "
+        doc_id = doc.get("doc_id", f"doc_{idx}")
+        print(f"[EXTRACTION] doc={doc_id} -> "
               f"{relations if relations else '[]  <-- NO RELATIONS EXTRACTED'}")
         print(f"  source text: {raw_text}")
 
         if not relations:
-            docs_with_zero_relations.append(doc.get("doc_id", filename))
+            docs_with_zero_relations.append(doc_id)
 
         for src, tgt in relations:
             engine.insert_edge(src, tgt)
             chunk_store.add_extraction(src, tgt, raw_text)
 
         if idx % 10 == 0:
-            print(f"[PROGRESS] {idx}/{len(files)} documents processed | "
+            print(f"[PROGRESS] {idx}/{len(docs)} documents processed | "
                   f"Nodes={len(engine.node_degrees)}, Edges={len(engine.edges)}")
 
     print(f"[STREAMING COMPLETE] Active Graph State: Nodes={len(engine.node_degrees)}, Edges={len(engine.edges)}")
-    print(f"[EXTRACTION SUMMARY] {len(docs_with_zero_relations)}/{len(files)} documents produced "
-          f"zero relations ({len(docs_with_zero_relations) / len(files) * 100:.1f}% extraction failure rate)")
+    print(f"[EXTRACTION SUMMARY] {len(docs_with_zero_relations)}/{len(docs)} documents produced "
+          f"zero relations ({len(docs_with_zero_relations) / len(docs) * 100:.1f}% extraction failure rate)")
     if docs_with_zero_relations:
         print(f"  Zero-relation doc_ids: {docs_with_zero_relations}")
 

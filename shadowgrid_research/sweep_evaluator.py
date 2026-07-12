@@ -1,13 +1,24 @@
+import os
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
+from vector_engine import VectorRAGEngine
+from graph_engine import BoundedGraphRAGEngine, BoundedChunkStore
 import hashlib
 import json
-import os
 import re
 import time
 import urllib.request
 import urllib.error
 import ssl
-from src.vector_engine import VectorRAGEngine
-from src.graph_engine import BoundedGraphRAGEngine, BoundedChunkStore
+ENTITY_PREFIX_PATTERN = re.compile(r"^(Project|Asset|Agent|Concept|Event)\s+", re.IGNORECASE)
+
+
+def normalize_entity(name):
+    """Strip known operational prefixes and surrounding whitespace so
+    variant surface forms of the same entity collapse onto one node."""
+    if not isinstance(name, str):
+        return name
+    return ENTITY_PREFIX_PATTERN.sub("", name).strip()
 
 
 class SweepEvaluator:
@@ -33,8 +44,8 @@ class SweepEvaluator:
         if not os.path.exists(self.eval_suite_path):
             os.makedirs(os.path.dirname(self.eval_suite_path), exist_ok=True)
             mock_suite = [
-                {"query": "Who was the initial engineer for ShadowGrid?", "ground_truth": "Agent Alexander", "target_entities": ["ShadowGrid", "Alexander"]},
-                {"query": "What database platform did ShadowGrid migrate to?", "ground_truth": "Qdrant", "target_entities": ["ShadowGrid", "Qdrant"]}
+                {"query_id": "mock_001", "type": "entity_lookup", "query": "Who was the initial engineer for ShadowGrid?", "ground_truth": "Agent Alexander", "target_entities": ["ShadowGrid", "Alexander"]},
+                {"query_id": "mock_002", "type": "entity_lookup", "query": "What database platform did ShadowGrid migrate to?", "ground_truth": "Qdrant", "target_entities": ["ShadowGrid", "Qdrant"]}
             ]
             with open(self.eval_suite_path, "w") as f:
                 json.dump(mock_suite, f, indent=4)
@@ -62,6 +73,11 @@ Output ONLY a JSON object with a single key "relations" containing an array of p
 Format: {{"relations": [["EntityA", "EntityB"]]}}
 Do not invent relationships. Ignore generic nouns.
 
+Strip operational prefixes from entity names before returning them: do not
+include the words "Project", "Asset", "Agent", "Concept", or "Event" as part
+of an entity name. For example, return "ShadowGrid" instead of "Project
+ShadowGrid", and "Alexander" instead of "Agent Alexander".
+
 Text: {chunk_text}
 """
         response = self.query_cloud_llm(prompt, max_retries=max_retries, json_mode=True)
@@ -79,7 +95,9 @@ Text: {chunk_text}
         valid_relations = []
         for pair in parsed.get("relations", []):
             if isinstance(pair, list) and len(pair) == 2:
-                valid_relations.append(tuple(pair))
+                src, tgt = normalize_entity(pair[0]), normalize_entity(pair[1])
+                if src and tgt:
+                    valid_relations.append((src, tgt))
         return valid_relations
 
     def get_relations_for_doc(self, text, max_retries=5):
@@ -141,11 +159,15 @@ Text: {chunk_text}
         ctx.verify_mode = ssl.CERT_NONE
 
         last_error = None
+        rate_limit_backoffs = 0
+        max_rate_limit_backoffs = max_retries * 4  # safety ceiling so persistent 429s can't loop forever
+        standard_attempts = 0
+        RETRYABLE_HTTP_CODES = {500, 502, 503, 504}  # transient gateway/server errors, not client-error 4xx
 
-        for attempt in range(max_retries):
+        while True:
             req = urllib.request.Request(url, data=payload, headers=headers)
             try:
-                with urllib.request.urlopen(req, context=ctx) as response:
+                with urllib.request.urlopen(req, context=ctx, timeout=30) as response:
                     res = json.loads(response.read().decode("utf-8"))
                     return res['choices'][0]['message']['content'].strip()
 
@@ -154,18 +176,39 @@ Text: {chunk_text}
                 last_error = f"ERROR {e.code}: {body}"
 
                 if e.code == 429:
+                    if rate_limit_backoffs >= max_rate_limit_backoffs:
+                        return f"ERROR: exceeded rate-limit backoff ceiling, last failure -> {last_error}"
                     match = re.search(r"try again in ([\d.]+)s", body)
-                    wait = float(match.group(1)) + 0.5 if match else (2 ** attempt)
-                    print(f"[RATE LIMIT] 429 received, backing off {wait:.2f}s (attempt {attempt + 1}/{max_retries})")
+                    wait = float(match.group(1)) + 0.5 if match else (2 ** rate_limit_backoffs)
+                    rate_limit_backoffs += 1
+                    print(f"[RATE LIMIT] 429 received, backing off {wait:.2f}s (backoff #{rate_limit_backoffs})")
                     time.sleep(wait)
+                    continue  # rate-limit backoffs no longer eat into max_retries
+
+                if e.code in RETRYABLE_HTTP_CODES:
+                    standard_attempts += 1
+                    if standard_attempts > max_retries:
+                        return f"ERROR: exhausted {max_retries} retries on transient HTTP errors. Last failure -> {last_error}"
+                    print(f"[TRANSIENT HTTP {e.code}] retrying (attempt {standard_attempts}/{max_retries})")
+                    time.sleep(1 * standard_attempts)
                     continue
 
+                # Non-retryable client error (400/401/403/404/etc) - retrying won't help
                 return last_error
 
-            except Exception as e:
-                return f"ERROR: {e}"
+            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+                # Covers socket drops, DNS blips, connect/read timeouts
+                last_error = f"ERROR: {e}"
+                standard_attempts += 1
+                if standard_attempts > max_retries:
+                    return f"ERROR: exhausted {max_retries} retries on network errors. Last failure -> {last_error}"
+                print(f"[NETWORK ERROR] {e} - retrying (attempt {standard_attempts}/{max_retries})")
+                time.sleep(1 * standard_attempts)
+                continue
 
-        return f"ERROR: max retries exceeded, last failure -> {last_error}"
+            except Exception as e:
+                # Unexpected/non-transient failure (e.g. JSON decode of a malformed 200) - don't retry blindly
+                return f"ERROR: {e}"
 
     def verify_accuracy_with_judge(self, query, ground_truth, model_output, query_id=None):
         if model_output.startswith("ERROR"):
@@ -202,11 +245,9 @@ GRADE: <1 or 0>
 
         lines = raw_response.split("\n")
         for line in reversed(lines):
-            if "GRADE:" in line:
-                if "1" in line and "0" not in line:
-                    return 1
-                if "0" in line:
-                    return 0
+            match = re.search(r"GRADE:\s*([01])(?:\.0+)?\b", line)
+            if match:
+                return int(match.group(1))
 
         print(f"[WARN] No GRADE line found in judge response for query_id={query_id} - excluding from scoring")
         return None
@@ -262,6 +303,11 @@ GRADE: <1 or 0>
 
     def evaluate_vector_baseline(self):
         vector_engine = VectorRAGEngine()
+        # TODO(Shiv): confirm this matches the real VectorRAGEngine API - src/vector_engine.py
+        # wasn't in this upload, so `ingest` is a best guess based on naming conventions
+        # used elsewhere in this file (ingest_corpus, insert_edge, add_extraction).
+        # Without an explicit push here, retrieve() below runs against an empty index and
+        # Control Group A silently returns empty context for every query.
         records = []
 
         print("\n=== STARTING VECTOR BASELINE EVALUATION ===")
@@ -346,7 +392,13 @@ GRADE: <1 or 0>
         results["Unbounded GraphRAG (Control B)"] = (acc, excluded, n, breakdown, t1, t2)
 
         print("[RUNNING] Executing Parameter Sweep for Bounded GraphRAG...")
-        for edges in range(2, 11):
+        # Wide, log-scaled steps: at max_edges in the 2-10 range, BoundedGraphRAGEngine
+        # evicts on almost every sentence ingested, so accuracy is flat/noisy and mostly
+        # exercises Tier 2 archiving rather than the bounding tradeoff itself. Scaling up
+        # toward the size of a well-connected doc sub-component (50-500 edges) is where
+        # the eviction-vs-accuracy curve actually differentiates from the unbounded control.
+        sweep_edges = [2, 5, 10, 25, 50, 100, 250, 500]
+        for edges in sweep_edges:
             acc, excluded, n, breakdown, t1, t2 = self.evaluate_graph_engine(max_edges=edges)
             results[f"Bounded GraphRAG (max_edges={edges})"] = (acc, excluded, n, breakdown, t1, t2)
             excl_note = f" (excluded {excluded} invalid data points)" if excluded else ""

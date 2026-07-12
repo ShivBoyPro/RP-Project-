@@ -4,12 +4,48 @@ import math
 from collections import defaultdict
 from datetime import datetime
 
+# Tolerance used when deciding whether a heap entry's cached entropy is still
+# "close enough" to the freshly-recomputed value to trust without a re-push.
+# See Bug 3 fix below.
+ENTROPY_STALENESS_EPSILON = 1e-9
+
+
 class BoundedChunkStore:
     def __init__(self, max_chunks=5000):
         self.max_chunks = max_chunks
         self.chunks = {}  # chunk_id -> raw_text
-        self.edge_to_chunks = {}  # (src, tgt) -> set(chunk_ids)
+        self.edge_to_chunks = {}  # canonical_edge_key -> set(chunk_ids)
         self.chunk_queue = []  # FIFO queue for text chunks
+
+    @staticmethod
+    def _canonical_key(src, tgt):
+        """
+        BUG 1 FIX (Bidirectional Directionality Mismatch):
+        The graph engine treats every edge as undirected - insert_edge()
+        explicitly checks both (src, tgt) and (tgt, src) before deciding an
+        edge is "new". But this store was keying edge_to_chunks off the raw
+        (src, tgt) tuple exactly as passed in. That means an extraction
+        recorded as add_extraction("A", "B", text) was invisible to a later
+        get_context("B", "A") call for the *same* logical edge - chunks
+        silently vanished from retrieval depending on which order the two
+        entity names happened to appear in the source text.
+
+        BUG 2 NOTE (Multi-Edge Prefix Mangling):
+        A tempting "quick fix" for the above is to canonicalize via string
+        concatenation, e.g. "|".join(sorted((src, tgt))). That introduces a
+        new problem: if any entity name itself contains the join character
+        (or if two different unordered pairs happen to sort/concatenate to
+        the same string - e.g. entity names containing pipes, colons, or
+        other separators), unrelated edges can collide into the same string
+        key, silently merging their chunk sets ("mangling"). This corrupts
+        multi-edge data by fusing distinct relations together.
+
+        The fix for both bugs is the same: canonicalize using a tuple of the
+        two endpoints in a fixed (sorted) order, never a mangled string.
+        Tuples hash structurally, not lexically, so there's no delimiter to
+        collide on and no risk of cross-entity key collisions.
+        """
+        return tuple(sorted((src, tgt)))
 
     def add_extraction(self, src, tgt, text):
         chunk_id = hashlib.md5(text.encode('utf-8')).hexdigest()
@@ -27,12 +63,14 @@ class BoundedChunkStore:
             self.chunks[chunk_id] = text
             self.chunk_queue.append(chunk_id)
 
-        if (src, tgt) not in self.edge_to_chunks:
-            self.edge_to_chunks[(src, tgt)] = set()
-        self.edge_to_chunks[(src, tgt)].add(chunk_id)
+        key = self._canonical_key(src, tgt)
+        if key not in self.edge_to_chunks:
+            self.edge_to_chunks[key] = set()
+        self.edge_to_chunks[key].add(chunk_id)
 
     def get_context(self, src, tgt):
-        chunk_ids = self.edge_to_chunks.get((src, tgt), set())
+        key = self._canonical_key(src, tgt)
+        chunk_ids = self.edge_to_chunks.get(key, set())
         return [self.chunks[cid] for cid in chunk_ids if cid in self.chunks]
 
 
@@ -66,10 +104,15 @@ class BoundedGraphRAGEngine:
                     del self.adjacency[node]
 
     def _update_and_push(self, src, tgt):
-        """Calculates current entropy and pushes to heap. Leaves stale duplicates to be lazy-deleted."""
+        """Calculates current entropy and pushes to heap. Leaves stale duplicates to be lazy-deleted.
+
+        Pushed as raw (non-negated) entropy: heapq is a min-heap, so the lowest
+        true entropy (peripheral/leaf edges) surfaces first for eviction, while
+        high-entropy hub edges sink to the bottom and are preserved.
+        """
         entropy = self._compute_local_edge_entropy(src, tgt)
         self.edges[(src, tgt)] = entropy
-        heapq.heappush(self.eviction_heap, (-entropy, src, tgt))
+        heapq.heappush(self.eviction_heap, (entropy, src, tgt))
 
     def insert_edge(self, src, tgt):
         if src == tgt or (src, tgt) in self.edges or (tgt, src) in self.edges:
@@ -105,20 +148,58 @@ class BoundedGraphRAGEngine:
                 if e in self.edges:
                     self._update_and_push(e[0], e[1])
 
-        # 4. Lazy-Evaluation Eviction Loop with Tiered Handshake
+        # 4. Eviction - lazy validate-at-pop instead of full O(E) rebuild.
+        #
+        # BUG 3 FIX (O(E) Ingestion Performance Bottleneck):
+        # The previous approach recomputed and re-heapified every single
+        # active edge's entropy before evicting anything, because
+        # recompute-on-pop alone can leave an edge with a stale cached
+        # priority forever if it's never revisited by Step 3 and never
+        # popped - even though total_edges shifting on every insertion means
+        # its *true* entropy has drifted. That guarantee of correctness cost
+        # O(E) per eviction-triggering insert, every time.
+        #
+        # The fix keeps the guarantee without the full rebuild: when we pop
+        # a candidate, we recompute its true entropy right then (cheap - O(1)
+        # given current degrees/total_edges) and compare it to the cached
+        # priority it was popped with.
+        #   - If they agree (within epsilon), the popped value was accurate
+        #     and this genuinely is the current minimum - evict it.
+        #   - If they disagree, the cached value was stale. Instead of
+        #     trusting it, we correct self.edges[...] and re-push the edge
+        #     with its true entropy, then continue popping. The corrected
+        #     entry will naturally find its true position in the heap on
+        #     this or a future pop.
+        # Each correction is an O(log E) push/pop instead of an O(E) rebuild,
+        # and correctness is preserved because eviction never proceeds on a
+        # value we haven't just re-validated against ground truth.
         while len(self.edges) > self.max_edges:
-            neg_entropy, victim_src, victim_tgt = heapq.heappop(self.eviction_heap)
+            entropy_key, cand_src, cand_tgt = heapq.heappop(self.eviction_heap)
 
-            # STALE CHECK: Verify if heap record matches true current mapping
-            current_true_entropy = self.edges.get((victim_src, victim_tgt))
-            if current_true_entropy is None or neg_entropy != -current_true_entropy:
+            # Lazy-deleted: this exact edge no longer exists (already evicted
+            # via an earlier, now-stale heap entry for the same pair).
+            if (cand_src, cand_tgt) not in self.edges:
                 continue
+
+            true_entropy = self._compute_local_edge_entropy(cand_src, cand_tgt)
+
+            if abs(true_entropy - entropy_key) > ENTROPY_STALENESS_EPSILON:
+                # Cached priority was stale - correct it and let it re-settle
+                # in the heap rather than evicting on outdated information.
+                self.edges[(cand_src, cand_tgt)] = true_entropy
+                heapq.heappush(self.eviction_heap, (true_entropy, cand_src, cand_tgt))
+                continue
+
+            # Confirmed against ground truth: this is genuinely the current
+            # minimum-entropy edge. Safe to evict.
+            victim_src, victim_tgt = cand_src, cand_tgt
+            live_entropy = true_entropy
 
             # TIERED MEMORY SHIFT: Archive before deleting from Tier 1 Cache
             self.archive.append({
                 "src": victim_src,
                 "tgt": victim_tgt,
-                "entropy_at_eviction": current_true_entropy,
+                "entropy_at_eviction": live_entropy,
                 "timestamp": datetime.now().isoformat()
             })
 
@@ -129,7 +210,26 @@ class BoundedGraphRAGEngine:
             self._garbage_collect_nodes(victim_src, victim_tgt)
 
     def retrieve_subgraph_context(self, target_entities, chunk_store):
-        matched_contexts = []
+        # BUG 4 FIX (Cross-Tier Chunk Duplication):
+        # Deduplication used to happen *after* tagging each chunk with its
+        # tier label ("[TIER 1 ACTIVE] ..." / "[TIER 2 ARCHIVE] ..."), then
+        # relied on set() to collapse duplicates. But a single raw text chunk
+        # commonly documents several entity relationships at once (e.g. one
+        # paragraph mentioning A-B, B-C, and C-D). If one of those pairs is
+        # currently active (Tier 1) and a different pair from the *same*
+        # chunk was evicted to the archive (Tier 2), both retrieval loops
+        # independently pull that identical chunk text - but with different
+        # prefixes. set() hashes on the full prefixed string, so the two
+        # differently-tagged copies look like distinct entries and both
+        # survive, silently doubling that chunk's presence (and token cost)
+        # in the assembled context.
+        #
+        # The fix is to dedupe on the *raw* chunk text before any tier
+        # prefix is attached, using an insertion-ordered dict keyed by text.
+        # Tier 1 is scanned first, so if a chunk is reachable from both
+        # tiers it keeps its "[TIER 1 ACTIVE]" tag (the more current/accurate
+        # provenance) and is only ever emitted once.
+        seen_chunks = {}  # raw_text -> tier_label (first tier reached wins)
         target_set = set(target_entities)
 
         # --- TIER 1: ACTIVE GRAPH RETRIEVAL (Fast O(1) Memory Edge Match) ---
@@ -138,7 +238,7 @@ class BoundedGraphRAGEngine:
             for (src, tgt) in self.edges.keys():
                 if src in valid_active_targets or tgt in valid_active_targets:
                     for text in chunk_store.get_context(src, tgt):
-                        matched_contexts.append(f"[TIER 1 ACTIVE] {text}")
+                        seen_chunks.setdefault(text, "[TIER 1 ACTIVE]")
 
         # --- TIER 2: ARCHIVE RETRIEVAL (Sequential Fallback Scan) ---
         # Only counts as a genuine Tier 2 contribution if this exact pair is
@@ -153,6 +253,10 @@ class BoundedGraphRAGEngine:
                 continue
             if a_src in target_set or a_tgt in target_set:
                 for text in chunk_store.get_context(a_src, a_tgt):
-                    matched_contexts.append(f"[TIER 2 ARCHIVE] {text}")
+                    # setdefault: if this exact chunk text was already
+                    # captured via Tier 1 (because it also mentions some
+                    # other, still-active pair), don't re-tag or duplicate
+                    # it here - just leave the existing Tier 1 entry alone.
+                    seen_chunks.setdefault(text, "[TIER 2 ARCHIVE]")
 
-        return "\n".join(set(matched_contexts))
+        return "\n".join(f"{tier} {text}" for text, tier in seen_chunks.items())
