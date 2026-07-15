@@ -6,7 +6,14 @@ import time
 from datetime import datetime, timedelta
 from groq import Groq
 from graph_engine import BoundedChunkStore, BoundedGraphRAGEngine
+import os
+from dotenv import load_dotenv
 
+# Load the keys out of the local .env file
+load_dotenv()
+
+# Safely fetch the variable from memory
+api_key = os.getenv("GROQ_API_KEY")
 
 # ---------------------------------------------------------------------------
 # Deterministic world model

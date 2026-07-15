@@ -10,6 +10,14 @@ import time
 import urllib.request
 import urllib.error
 import ssl
+import os
+from dotenv import load_dotenv
+
+# Load the keys out of the local .env file
+load_dotenv()
+
+# Safely fetch the variable from memory
+api_key = os.getenv("GROQ_API_KEY")
 ENTITY_PREFIX_PATTERN = re.compile(r"^(Project|Asset|Agent|Concept|Event)\s+", re.IGNORECASE)
 
 
