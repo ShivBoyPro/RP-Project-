@@ -1,54 +1,52 @@
 import os
 import sys
 from dotenv import load_dotenv
-from src.graph_engine import BoundedGraphRAGEngine, BoundedChunkStore
 
-# Load credentials from .env
+# Load environment variables
 load_dotenv()
 
+# Verify API key
+if not os.getenv("GROQ_API_KEY"):
+    print("CRITICAL ERROR: GROQ_API_KEY is not set in your .env file.")
+    sys.exit(1)
+
+from src.graph_engine import BoundedGraphRAGEngine, BoundedChunkStore
+from src.ingestor import ingest_corpus
 
 def main():
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
-        print("Error: GROQ_API_KEY not found in .env.")
-        sys.exit(1)
-
-    # Production Initialization
-    # Ensure graph_engine.py defaults max_edges to 50
+    print("Initializing Bounded GraphRAG System...")
     engine = BoundedGraphRAGEngine()
     chunk_store = BoundedChunkStore()
 
-    # KNOWN GAP: ingestion is not wired up. Without a call that populates
-    # the graph via engine.insert_edge(...) and chunk_store.add_extraction(...),
-    # the graph and chunk store stay empty for the life of the process, and
-    # every query() call below will return "" — not an error, just no
-    # context. This is a silent-failure mode, not a crash, so it's easy to
-    # miss in testing. Wire up real ingestion before treating this as
-    # production-ready.
-    #
-    # engine.ingest("data/clean_corpus.json", chunk_store)
+    corpus_path = "data/corpus.json"
+    
+    # Run the ingestion
+    success = ingest_corpus(corpus_path, engine, chunk_store)
+    if not success:
+        print("Failed to ingest corpus. Exiting.")
+        sys.exit(1)
 
-    # Core Production Loop
-    try:
-        while True:
-            query = input("\nQuery: ")
-            if query.lower() in ["exit", "quit"]:
+    print("\nSystem ready. Type 'exit' to quit.")
+
+    # Query loop
+    while True:
+        try:
+            user_input = input("\nQuery: ").strip()
+            if user_input.lower() in ['exit', 'quit']:
                 break
-
-            try:
-                response = engine.query(query, chunk_store)
-            except Exception as e:
-                print(f"\nError while processing query: {e}")
+            if not user_input:
                 continue
-
-            if not response:
-                print("\nResponse: (no context found for this query)")
+            
+            result = engine.query(user_input, chunk_store)
+            
+            if result:
+                print(f"\nResult:\n{result}")
             else:
-                print(f"\nResponse: {response}")
-
-    except KeyboardInterrupt:
-        print("\nShutting down.")
-
+                print("\n(no context found)")
+                
+        except KeyboardInterrupt:
+            print("\nExiting.")
+            break
 
 if __name__ == "__main__":
     main()
