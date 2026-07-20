@@ -18,7 +18,16 @@ def main():
     engine = BoundedGraphRAGEngine()
     chunk_store = BoundedChunkStore()
 
-    corpus_path = "data/corpus.json"
+    # Switch from sample fixture to the full capacity dataset
+    corpus_path = "data/corpus_large.json"
+    
+    # Run the ingestion
+    success = ingest_corpus(corpus_path, engine, chunk_store)
+    print("Initializing Bounded GraphRAG System...")
+    engine = BoundedGraphRAGEngine()
+    chunk_store = BoundedChunkStore()
+
+    corpus_path = "data/corpus_large.json"
     
     # Run the ingestion
     success = ingest_corpus(corpus_path, engine, chunk_store)

@@ -5,7 +5,7 @@ import re
 import time
 from datetime import datetime, timedelta
 from groq import Groq
-from graph_engine import BoundedChunkStore, BoundedGraphRAGEngine
+from graph_engine import BoundedChunkStore, BoundedGraphRAGEngine, normalize_entity
 import os
 from dotenv import load_dotenv
 
@@ -242,19 +242,9 @@ def _get_client():
     return _client
 
 
-# Operational prefixes that appear in source text but should not survive
-# into the graph as part of the entity name, or "Project ShadowGrid" and
-# "ShadowGrid" fracture into two distinct nodes even though every downstream
-# query and ground_truth string uses the bare form.
-ENTITY_PREFIX_PATTERN = re.compile(r"^(Project|Asset|Agent|Concept|Event)\s+", re.IGNORECASE)
-
-
-def normalize_entity(name):
-    """Strip known operational prefixes and surrounding whitespace so
-    variant surface forms of the same entity collapse onto one node."""
-    if not isinstance(name, str):
-        return name
-    return ENTITY_PREFIX_PATTERN.sub("", name).strip()
+# normalize_entity() now lives in graph_engine.py — imported above — so
+# ingestion, generation, and query-time extraction all share one prefix list
+# instead of three independently-maintained copies.
 
 
 def extract_relations_streaming(chunk_text, max_retries=5, client=None):

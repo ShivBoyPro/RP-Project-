@@ -2,10 +2,7 @@ import json
 import os
 import re
 
-# Prefixes that generator.py strips during query-side entity normalization.
-# Ingestion must strip the same prefixes, or a node created here as
-# "Project ShadowGrid" will never match a query-side extraction of "ShadowGrid".
-_STRIP_PREFIXES = ("Project ", "Asset ", "Agent ")
+from graph_engine import normalize_entity
 
 # Generic capitalized-phrase matcher: catches multi-word proper nouns like
 # "Project ShadowGrid", "Concept Vector-Embeddings", "Agent Bianca", as well
@@ -21,17 +18,6 @@ _STOPWORDS = {
 }
 
 
-def _normalize_entity(raw):
-    """Strip known prefixes and collapse whitespace so ingestion-time node
-    names line up with query-time entity extraction."""
-    name = raw.strip()
-    for prefix in _STRIP_PREFIXES:
-        if name.startswith(prefix):
-            name = name[len(prefix):]
-            break
-    return name.strip()
-
-
 def extract_entities(content):
     """Pull normalized proper-noun entities out of a chunk of text."""
     if not content:
@@ -39,7 +25,7 @@ def extract_entities(content):
 
     entities = set()
     for match in _ENTITY_PATTERN.findall(content):
-        candidate = _normalize_entity(match)
+        candidate = normalize_entity(match)
         if not candidate or candidate in _STOPWORDS:
             continue
         if len(candidate) < 3:
