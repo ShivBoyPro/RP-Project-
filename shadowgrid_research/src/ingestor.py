@@ -2,8 +2,7 @@ import json
 import os
 import re
 
-from graph_engine import normalize_entity
-
+from src.graph_engine import normalize_entity
 # Generic capitalized-phrase matcher: catches multi-word proper nouns like
 # "Project ShadowGrid", "Concept Vector-Embeddings", "Agent Bianca", as well
 # as single-token proper nouns like "PostgreSQL" or "Qdrant".
