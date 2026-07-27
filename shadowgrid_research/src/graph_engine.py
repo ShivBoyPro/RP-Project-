@@ -95,7 +95,7 @@ def _extract_entities(query_text):
 class BoundedChunkStore:
     def __init__(self, max_chunks=5000):
         self.max_chunks = max_chunks
-        self.chunks = {}  # chunk_id -> raw_text
+        self.chunks = {}  # chunk_id -> (raw_text, timestamp)
         self.edge_to_chunks = {}  # canonical_edge_key -> set(chunk_ids)
         self.chunk_queue = []  # FIFO queue for text chunks
 
@@ -103,8 +103,17 @@ class BoundedChunkStore:
     def _canonical_key(src, tgt):
         return tuple(sorted((src, tgt)))
 
-    def add_extraction(self, src, tgt, text):
-        chunk_id = hashlib.md5(text.encode('utf-8')).hexdigest()
+    def add_extraction(self, src, tgt, text, timestamp=None):
+        # Hash on (text, timestamp) together, not text alone. Hashing text
+        # alone meant identical text ingested at two different times (e.g.
+        # a repeated boilerplate sentence in two docs with different
+        # `timestamp` fields) collapsed onto one chunk_id, and whichever
+        # timestamp was written first silently won forever — the second
+        # doc's assertion of the same text at a different time was dropped
+        # on the floor with no error. Including the timestamp in the hash
+        # means distinct timestamps get distinct chunk_ids and both survive;
+        # identical (text, timestamp) pairs still dedup as intended.
+        chunk_id = hashlib.md5(f"{text}\x00{timestamp}".encode('utf-8')).hexdigest()
 
         if chunk_id not in self.chunks:
             if len(self.chunks) >= self.max_chunks:
@@ -116,7 +125,7 @@ class BoundedChunkStore:
                     if not self.edge_to_chunks[e_key]:
                         del self.edge_to_chunks[e_key]
 
-            self.chunks[chunk_id] = text
+            self.chunks[chunk_id] = (text, timestamp)
             self.chunk_queue.append(chunk_id)
 
         key = self._canonical_key(src, tgt)
@@ -125,6 +134,7 @@ class BoundedChunkStore:
         self.edge_to_chunks[key].add(chunk_id)
 
     def get_context(self, src, tgt):
+        """Returns (text, timestamp) tuples for every chunk on this edge."""
         key = self._canonical_key(src, tgt)
         chunk_ids = self.edge_to_chunks.get(key, set())
         return [self.chunks[cid] for cid in chunk_ids if cid in self.chunks]
@@ -138,6 +148,22 @@ class BoundedGraphRAGEngine:
         self.adjacency = defaultdict(set)
         self.edges = {}  # (src, tgt) -> true_current_entropy
         self.eviction_heap = []
+
+        # --- Tier telemetry ---
+        # Cumulative counters across every retrieve_subgraph_context() call
+        # made on this engine instance. "tier1_hits"/"tier2_hits" count
+        # QUERIES (not chunks/edges) where at least one contributing chunk
+        # came from that tier — same "hit" definition callers like
+        # sweep_evaluator.py use for their per-config hit ratios.
+        # total_requests counts every retrieve_subgraph_context() call,
+        # including ones that hit neither tier (empty/unresolved frontier).
+        self.metrics = {"tier1_hits": 0, "tier2_hits": 0, "total_requests": 0}
+
+        # Per-query snapshot, overwritten on every retrieve_subgraph_context()
+        # call. This is what callers should read immediately after a query
+        # to get that query's tier1/tier2 hit booleans — self.metrics only
+        # gives cumulative totals across the engine's whole lifetime.
+        self.last_query_metrics = {"tier1_hit": False, "tier2_hit": False}
 
         # --- Archive tier (evicted edges), maintained incrementally ---
         # self.archive: FIFO-ordered list of archive entry dicts. This is an
@@ -308,13 +334,14 @@ class BoundedGraphRAGEngine:
         self._garbage_collect_nodes(victim_src, victim_tgt)
 
     def _active_edges_for_node(self, node):
-        """Live (uncollapsed) edges touching `node`, with cached entropy."""
+        """Live (uncollapsed) edges touching `node`, with cached entropy.
+        Tagged "active" (Tier 1) — see _edges_for_node."""
         result = []
         for neighbor in self.adjacency.get(node, ()):
             e = (node, neighbor) if (node, neighbor) in self.edges else (neighbor, node)
             entropy = self.edges.get(e)
             if entropy is not None:
-                result.append((neighbor, e, entropy))
+                result.append((neighbor, e, entropy, "active"))
         return result
 
     def _archived_edges_for_node(self, node):
@@ -322,10 +349,11 @@ class BoundedGraphRAGEngine:
         Archived edges touching `node`, read directly from the incrementally
         maintained self.archive_index — no scan of self.archive required.
         Replaces the old pattern of calling _build_archive_index() and then
-        indexing into its result.
+        indexing into its result. Tagged "archive" (Tier 2) — see
+        _edges_for_node.
         """
         return [
-            (neighbor, key, entropy)
+            (neighbor, key, entropy, "archive")
             for key, (neighbor, entropy) in self.archive_index.get(node, {}).items()
         ]
 
@@ -348,7 +376,15 @@ class BoundedGraphRAGEngine:
         return index
 
     def _edges_for_node(self, node):
-        """Active + archived edges touching `node`, combined for traversal."""
+        """
+        Active + archived edges touching `node`, combined for traversal.
+        Each tuple is (neighbor, edge_key, entropy, tier) where tier is
+        "active" (Tier 1) or "archive" (Tier 2) — combining the two lists
+        for fanout-ranking purposes (_select_expansion_edges doesn't care
+        which tier a candidate came from) must not lose that tag, since
+        retrieve_subgraph_context needs it downstream to attribute which
+        tier actually contributed context for a given query.
+        """
         return self._active_edges_for_node(node) + self._archived_edges_for_node(node)
 
     def _select_expansion_edges(self, edges_with_entropy, hub_degree_threshold, hub_fanout_cap):
@@ -435,9 +471,28 @@ class BoundedGraphRAGEngine:
 
     def retrieve_subgraph_context(self, target_entities, chunk_store,
                                    max_hops=2, hub_degree_threshold=None, hub_fanout_cap=None):
-        seen_chunks = set()
+        seen_chunks = set()  # set of (text, timestamp) pairs — see note below
         visited_edges = set()
         target_set = set(target_entities)
+
+        # Tier telemetry for THIS call only. Deliberately tracked as plain
+        # booleans over traversed edges rather than by prefixing tier tags
+        # onto the chunk text itself (the old approach) — tag-prefixing
+        # chunk text broke set()-based dedup whenever the same chunk was
+        # reachable via both an active and an archived edge (identical
+        # content, different prefix -> both copies survive dedup and get
+        # handed to the LLM twice). Keeping seen_chunks keyed by the full
+        # (text, timestamp) pair — not text alone — avoids reintroducing
+        # that bug while also avoiding a newer one: if seen_chunks were a
+        # text-keyed dict, the same text reaching this method twice with two
+        # different timestamps (now possible since chunk_id hashes on
+        # text+timestamp, see add_extraction) would let whichever BFS path
+        # got visited last silently overwrite the other timestamp — and
+        # frontier traversal order is a set(), so that's nondeterministic.
+        # A set of (text, timestamp) tuples keeps both entries and lets
+        # legitimate exact-duplicate (text, timestamp) pairs still dedup.
+        tier1_hit = False
+        tier2_hit = False
 
         # No archive_index rebuild here — self.archive_index is already
         # current, maintained incrementally by insert_edge/_evict_edge on
@@ -465,19 +520,46 @@ class BoundedGraphRAGEngine:
             for node in frontier:
                 candidates = self._edges_for_node(node)
                 selected = self._select_expansion_edges(candidates, hub_degree_threshold, hub_fanout_cap)
-                for neighbor, e_key, _entropy in selected:
+                for neighbor, e_key, _entropy, tier in selected:
                     canon = tuple(sorted(e_key))
                     if canon in visited_edges:
                         continue
                     visited_edges.add(canon)
-                    for text in chunk_store.get_context(e_key[0], e_key[1]):
-                        seen_chunks.add(text)
+                    edge_chunks = chunk_store.get_context(e_key[0], e_key[1])
+                    if edge_chunks:
+                        if tier == "active":
+                            tier1_hit = True
+                        else:
+                            tier2_hit = True
+                    for text, ts in edge_chunks:
+                        seen_chunks.add((text, ts))
                     if neighbor not in visited_nodes:
                         next_frontier.add(neighbor)
             visited_nodes |= next_frontier
             frontier = next_frontier
 
-        return "\n".join(seen_chunks)
+        self.last_query_metrics = {"tier1_hit": tier1_hit, "tier2_hit": tier2_hit}
+        self.metrics["total_requests"] += 1
+        if tier1_hit:
+            self.metrics["tier1_hits"] += 1
+        if tier2_hit:
+            self.metrics["tier2_hits"] += 1
+
+        # Coerce every timestamp to a string before comparing. `sorted()`
+        # compares keys pairwise, and Python raises TypeError comparing
+        # str to non-str (e.g. a bare datetime or int epoch some future
+        # caller passes in) rather than silently ordering them — str(ts)
+        # keeps the sort robust even if add_extraction's contract on what
+        # a "timestamp" is ever drifts. ISO-8601 strings still sort
+        # correctly under plain string comparison.
+        ordered_chunks = sorted(
+            seen_chunks,
+            key=lambda pair: str(pair[1]) if pair[1] is not None else ""
+        )
+        formatted_context = [
+            f"[{ts if ts else 'UNKNOWN'}] {text}" for text, ts in ordered_chunks
+        ]
+        return "\n\n".join(formatted_context)
 
     def query(self, query_text, chunk_store, max_hops=2, hub_degree_threshold=None, hub_fanout_cap=None):
         """

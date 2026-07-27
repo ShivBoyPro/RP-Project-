@@ -1,8 +1,8 @@
 import os
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
-from vector_engine import VectorRAGEngine
-from graph_engine import BoundedGraphRAGEngine, BoundedChunkStore
+from src.vector_engine import VectorRAGEngine
+from src.graph_engine import BoundedGraphRAGEngine, BoundedChunkStore
 import hashlib
 import json
 import re
@@ -138,9 +138,10 @@ Text: {chunk_text}
             relations = self.get_relations_for_doc(text)
             if not relations:
                 zero_relation_docs.append(doc.get("doc_id", "?"))
+            timestamp = doc.get("timestamp") or doc.get("created_at")
             for src, tgt in relations:
                 graph_engine.insert_edge(src, tgt)
-                chunk_store.add_extraction(src, tgt, text)
+                chunk_store.add_extraction(src, tgt, text, timestamp)
 
         if zero_relation_docs:
             print(f"[EXTRACTION SUMMARY] {len(zero_relation_docs)}/{len(self.corpus)} "
@@ -261,18 +262,6 @@ GRADE: <1 or 0>
         return None
 
     @staticmethod
-    def _parse_tier_usage(context):
-        """
-        Parses the [TIER 1 ACTIVE] / [TIER 2 ARCHIVE] telemetry tags that
-        BoundedGraphRAGEngine.retrieve_subgraph_context prefixes onto each
-        matched text chunk. A "hit" means at least one chunk from that tier
-        made it into the context handed to the LLM for this query.
-        """
-        tier1_hit = "[TIER 1 ACTIVE]" in context
-        tier2_hit = "[TIER 2 ARCHIVE]" in context
-        return tier1_hit, tier2_hit
-
-    @staticmethod
     def _score_summary(records):
         """
         records: list of dicts {query_id, type, score, tier1_hit, tier2_hit}
@@ -371,20 +360,35 @@ GRADE: <1 or 0>
             qtype = q.get("type", "unknown")
 
             context = graph_engine.retrieve_subgraph_context(q['target_entities'], chunk_store)
-            tier1_hit, tier2_hit = self._parse_tier_usage(context)
+            # Read this query's tier hit info directly off the engine
+            # instance — retrieve_subgraph_context() overwrites
+            # last_query_metrics on every call, so this reflects exactly
+            # the traversal that just produced `context`, not stale text
+            # tags that the engine never actually emitted into context.
+            tier1_hit = graph_engine.last_query_metrics["tier1_hit"]
+            tier2_hit = graph_engine.last_query_metrics["tier2_hit"]
 
             print(f"\n[DIAGNOSTIC] Query: {q['query']} [id={qid}, type={qtype}]")
             print(f"--- RAW GRAPH CONTEXT SURFACE (Tier1={tier1_hit}, Tier2={tier2_hit}) ---")
             print(context if context.strip() else "[EMPTY CONTEXT]")
             print(f"---------------------------------")
 
-            prompt = f"Context:\n{context}\n\nQuestion: {q['query']}\nAnswer thoroughly, including all relevant background details, project names, and migration history mentioned in the context."
+            prompt = (
+                f"Context entries are timestamped and listed in chronological order "
+                f"from oldest to newest. Later entries explicitly supersede earlier "
+                f"ones when facts or system states conflict.\n\n"
+                f"Context:\n{context}\n\nQuestion: {q['query']}\nAnswer thoroughly, "
+                f"including all relevant background details, project names, and "
+                f"migration history mentioned in the context."
+            )
             output = self.query_cloud_llm(prompt)
             print(f"[LLM OUTPUT]: {output}")
 
             score = self.verify_accuracy_with_judge(q['query'], q['ground_truth'], output, query_id=qid)
             records.append({"query_id": qid, "type": qtype, "score": score,
                              "tier1_hit": tier1_hit, "tier2_hit": tier2_hit})
+
+        print(f"[TIER METRICS] engine.metrics for max_edges={max_edges}: {graph_engine.metrics}")
 
         return self._score_summary(records)
 

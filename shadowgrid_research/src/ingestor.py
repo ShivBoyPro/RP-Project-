@@ -53,6 +53,7 @@ def ingest_corpus(file_path, engine, chunk_store):
         # silently no-op against real corpus data.
         node_id = entry.get("doc_id") or entry.get("id")
         content = entry.get("content")
+        timestamp = entry.get("timestamp") or entry.get("created_at")
 
         if not node_id or not content:
             continue
@@ -63,7 +64,7 @@ def ingest_corpus(file_path, engine, chunk_store):
             # No proper nouns found (e.g. pure boilerplate/log noise) — still
             # index the raw chunk under its own doc id so the content isn't
             # silently dropped, but don't fabricate a fake relational edge.
-            chunk_store.add_extraction(node_id, node_id, content)
+            chunk_store.add_extraction(node_id, node_id, content, timestamp)
             continue
 
         entity_list = sorted(entities)
@@ -72,7 +73,7 @@ def ingest_corpus(file_path, engine, chunk_store):
         # the chunk content under the entity so retrieval-by-entity works.
         for entity in entity_list:
             engine.insert_edge(entity, node_id)
-            chunk_store.add_extraction(entity, node_id, content)
+            chunk_store.add_extraction(entity, node_id, content, timestamp)
 
         # Link co-occurring entities to each other — this is what gives the
         # graph actual relational structure (e.g. ShadowGrid <-> PostgreSQL,
