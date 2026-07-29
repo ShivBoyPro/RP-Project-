@@ -261,7 +261,17 @@ class BoundedGraphRAGEngine:
 
         for node in (src, tgt):
             for neighbor in self.adjacency[node]:
-                if neighbor == tgt and node == src:
+                # The (src, tgt) edge itself was already pushed above via
+                # _update_and_push(src, tgt) — skip it here in BOTH
+                # directions. The old check only matched (node=src,
+                # neighbor=tgt) and missed the symmetric (node=tgt,
+                # neighbor=src) case, which is also reachable in this loop
+                # since adjacency is bidirectional. That meant every single
+                # insert_edge call pushed one redundant duplicate heap
+                # entry for the new edge on top of the intentional one —
+                # harmless (the staleness check at eviction time discards
+                # it) but pure heap bloat with no purpose.
+                if (node == src and neighbor == tgt) or (node == tgt and neighbor == src):
                     continue
                 e = (node, neighbor) if (node, neighbor) in self.edges else (neighbor, node)
                 if e in self.edges:
@@ -387,35 +397,78 @@ class BoundedGraphRAGEngine:
         """
         return self._active_edges_for_node(node) + self._archived_edges_for_node(node)
 
-    def _select_expansion_edges(self, edges_with_entropy, hub_degree_threshold, hub_fanout_cap):
+    def _select_expansion_edges(self, edges_with_entropy, hub_degree_threshold,
+                                 hub_fanout_cap, remaining_targets=None):
         """
         Fan-out control for hub nodes. Below threshold, expand everything.
-        Above threshold, keep only the `hub_fanout_cap` neighbors with the
-        LOWEST total structural footprint — active degree PLUS archived
-        edge count, not active degree alone.
 
-        Active-degree-only ranking has a real blind spot: a node whose
-        edges are almost entirely evicted shows active degree 0 (or is
-        absent from node_degrees entirely) and gets ranked as if it were a
-        specific leaf, even when it's actually a historical mega-hub with
-        a dozen archived spokes waiting behind it. Confirmed by test: a
-        12-spoke evicted hub outranked a genuine 1-edge leaf under
-        degree-only sorting and would have dumped its spokes into the next
-        hop. Counting archived edges via self.archive_index fixes this
-        specific case.
+        Above threshold, candidates split into three priority tiers instead
+        of a single footprint-sorted cut:
 
-        Still heuristic: this is structural specificity, not query
-        relevance. Reading self.archive_index is now O(1) per node lookup
-        (dict), not a per-query archive scan.
+          1. GUARANTEED — the neighbor is one of the query's own remaining
+             target entities (passed in via `remaining_targets`). This is
+             confirmed relevant by the query itself, so it always survives,
+             regardless of footprint or fanout_cap.
+
+          2. BRIDGES — neighbor's total structural footprint (active degree
+             PLUS archived edge count) exceeds hub_degree_threshold. A node
+             this well-connected is a structural hub/bridge in its own
+             right, and multi-hop queries routinely need to cross exactly
+             this kind of node to get from one named entity to another
+             (Entity A -> [bridge] -> Entity C). Bridges bypass the cap
+             entirely, same as guaranteed targets.
+
+          3. ORDINARY — everything else. These compete for whatever
+             fanout_cap slots remain, ranked ascending by footprint
+             (prefer the more specific/leaf-like candidates among
+             genuinely ambiguous ones).
+
+        Root-cause note (Session 12): the previous version ranked ALL
+        candidates by ascending footprint and kept only the lowest-
+        footprint (leaf-like) neighbors, discarding the highest-footprint
+        ones first. That is backwards for multi-hop retrieval — the nodes
+        it discarded first were exactly the well-connected bridges a
+        second or third hop depends on, so traversal was severed at hop 1
+        before it ever reached the entity the query asked about. This is
+        what caused multi_hop accuracy to collapse to 20%-40% while
+        single-hop and temporal-drift queries (which never need to cross a
+        bridge) stayed unaffected.
+
+        Active-degree-only footprint has a separate, already-fixed blind
+        spot: a node whose edges are almost entirely evicted shows active
+        degree 0 (or is absent from node_degrees entirely) and would be
+        misjudged as a specific leaf, even when it's actually a historical
+        mega-hub with a dozen archived spokes. Counting archived edges via
+        self.archive_index (as total_footprint does below) fixes that
+        classification regardless of which tier a candidate lands in.
+
+        Still a heuristic for tiers 2 and 3 — this controls HOW MANY/WHICH
+        edges expand, not a guarantee of query relevance. Tier 1 is the
+        only tier with a real relevance signal (the query itself). Reading
+        self.archive_index is O(1) per node lookup (dict), not a per-query
+        archive scan.
         """
         if len(edges_with_entropy) <= hub_degree_threshold:
             return edges_with_entropy
 
+        remaining_targets = remaining_targets or frozenset()
+
         def total_footprint(node):
             return self.node_degrees.get(node, 0) + len(self.archive_index.get(node, {}))
 
-        ranked = sorted(edges_with_entropy, key=lambda item: total_footprint(item[0]))
-        return ranked[:hub_fanout_cap]
+        guaranteed, bridges, ordinary = [], [], []
+        for item in edges_with_entropy:
+            neighbor = item[0]
+            if neighbor in remaining_targets:
+                guaranteed.append(item)
+            elif total_footprint(neighbor) > hub_degree_threshold:
+                bridges.append(item)
+            else:
+                ordinary.append(item)
+
+        slots_left = max(hub_fanout_cap - len(guaranteed) - len(bridges), 0)
+        ordinary_ranked = sorted(ordinary, key=lambda item: total_footprint(item[0]))
+        return guaranteed + bridges + ordinary_ranked[:slots_left]
 
     def _adaptive_hub_params(self):
         """
@@ -517,9 +570,16 @@ class BoundedGraphRAGEngine:
             if not frontier:
                 break
             next_frontier = set()
+            # Targets not yet reached by this traversal — always exempt
+            # from fanout capping (see _select_expansion_edges tier 1).
+            # Computed once per hop since visited_nodes only changes
+            # between hops, not within one.
+            remaining_targets = target_set - visited_nodes
             for node in frontier:
                 candidates = self._edges_for_node(node)
-                selected = self._select_expansion_edges(candidates, hub_degree_threshold, hub_fanout_cap)
+                selected = self._select_expansion_edges(
+                    candidates, hub_degree_threshold, hub_fanout_cap, remaining_targets
+                )
                 for neighbor, e_key, _entropy, tier in selected:
                     canon = tuple(sorted(e_key))
                     if canon in visited_edges:
