@@ -524,7 +524,16 @@ class BoundedGraphRAGEngine:
 
     def retrieve_subgraph_context(self, target_entities, chunk_store,
                                    max_hops=2, hub_degree_threshold=None, hub_fanout_cap=None):
-        seen_chunks = set()  # set of (text, timestamp) pairs — see note below
+        # set of (canonical_edge_key, text, timestamp) triples — see note
+        # below. The canonical_edge_key is now part of the dedup/identity
+        # key (not just text+timestamp) because conflict resolution below
+        # needs to group chunks back by the edge (i.e. subject-object pair)
+        # they were attached to: two chunks with different text on the
+        # SAME edge at different timestamps are exactly the "same
+        # subject-predicate relation, conflicting/evolving object state"
+        # case objective 1 asks us to flag, and that grouping is lost the
+        # moment we flatten to a bare (text, timestamp) set.
+        seen_chunks = set()
         visited_edges = set()
         target_set = set(target_entities)
 
@@ -542,8 +551,10 @@ class BoundedGraphRAGEngine:
         # text+timestamp, see add_extraction) would let whichever BFS path
         # got visited last silently overwrite the other timestamp — and
         # frontier traversal order is a set(), so that's nondeterministic.
-        # A set of (text, timestamp) tuples keeps both entries and lets
-        # legitimate exact-duplicate (text, timestamp) pairs still dedup.
+        # A set of (edge_key, text, timestamp) triples keeps both entries
+        # and lets legitimate exact-duplicate (edge_key, text, timestamp)
+        # triples still dedup, while preserving which edge each chunk came
+        # from so it can be grouped for conflict/supersession tagging below.
         tier1_hit = False
         tier2_hit = False
 
@@ -592,7 +603,7 @@ class BoundedGraphRAGEngine:
                         else:
                             tier2_hit = True
                     for text, ts in edge_chunks:
-                        seen_chunks.add((text, ts))
+                        seen_chunks.add((canon, text, ts))
                     if neighbor not in visited_nodes:
                         next_frontier.add(neighbor)
             visited_nodes |= next_frontier
@@ -605,20 +616,83 @@ class BoundedGraphRAGEngine:
         if tier2_hit:
             self.metrics["tier2_hits"] += 1
 
-        # Coerce every timestamp to a string before comparing. `sorted()`
-        # compares keys pairwise, and Python raises TypeError comparing
-        # str to non-str (e.g. a bare datetime or int epoch some future
-        # caller passes in) rather than silently ordering them — str(ts)
-        # keeps the sort robust even if add_extraction's contract on what
-        # a "timestamp" is ever drifts. ISO-8601 strings still sort
-        # correctly under plain string comparison.
-        ordered_chunks = sorted(
-            seen_chunks,
-            key=lambda pair: str(pair[1]) if pair[1] is not None else ""
-        )
-        formatted_context = [
-            f"[{ts if ts else 'UNKNOWN'}] {text}" for text, ts in ordered_chunks
-        ]
+        # Coerce every timestamp to a string before comparing. Plain
+        # sorted()/comparisons raise TypeError comparing str to non-str
+        # (e.g. a bare datetime or int epoch some future caller passes in)
+        # rather than silently ordering them — str(ts) keeps every sort
+        # below robust even if add_extraction's contract on what a
+        # "timestamp" is ever drifts. ISO-8601 strings still sort
+        # correctly under plain string comparison. Missing timestamps sort
+        # first (empty string), i.e. treated as oldest/least-certain.
+        def _ts_key(ts):
+            return str(ts) if ts is not None else ""
+
+        # --- Edge conflict resolution / temporal superseding ---
+        # Group chunks back by the edge they were retrieved from. Multiple
+        # chunks on the SAME edge represent multiple assertions about that
+        # same subject-object relation made at different times — exactly
+        # the "historical state contradiction" case objective 1 targets
+        # (e.g. an edge chunk from six months ago and a chunk from last
+        # week both attached to the same (src, tgt) pair, asserting two
+        # different states of that relationship). A single chunk on an
+        # edge has nothing to conflict with, so it's left untagged.
+        edge_groups = defaultdict(list)
+        for edge_key, text, ts in seen_chunks:
+            edge_groups[edge_key].append((text, ts))
+
+        tagged_chunks = []  # (text, timestamp, tag_or_None)
+        for group in edge_groups.values():
+            group_sorted = sorted(group, key=lambda pair: _ts_key(pair[1]))
+            if len(group_sorted) > 1:
+                # Strict chronological ordering within the edge: every
+                # earlier assertion is historical/superseded, the most
+                # recent one (by timestamp) is the currently-active state.
+                # This is a per-edge signal, not a query-relevance one —
+                # it fires purely on "this edge has >1 timestamped chunk",
+                # so it also flags edges where the chunks merely restate
+                # the same fact at different times, not just true
+                # contradictions; that's an acceptable false-positive
+                # given the alternative (silently letting a genuinely
+                # stale state read as current to the synthesis LLM).
+                for text, ts in group_sorted[:-1]:
+                    tagged_chunks.append((text, ts, "SUPERSEDED / HISTORICAL STATE"))
+                latest_text, latest_ts = group_sorted[-1]
+                tagged_chunks.append((latest_text, latest_ts, "ACTIVE / LATEST STATE"))
+            else:
+                text, ts = group_sorted[0]
+                tagged_chunks.append((text, ts, None))
+
+        # A chunk's raw text can be attached to more than one edge (e.g. one
+        # sentence that mentions two different entity pairs), so the same
+        # (text, timestamp) can legitimately appear in more than one edge's
+        # group above with different tags — tagged in a group that has a
+        # conflict, untagged in a group that doesn't. Collapse those back
+        # down to one line each so the same sentence isn't shown twice to
+        # the synthesis LLM; keep whichever copy carries a tag; if two
+        # edges disagree on the tag for identical text, keep the first one
+        # seen deterministically rather than let set-iteration order decide.
+        deduped = {}
+        for text, ts, tag in tagged_chunks:
+            dkey = (text, ts)
+            if dkey not in deduped or (deduped[dkey][2] is None and tag is not None):
+                deduped[dkey] = (text, ts, tag)
+        tagged_chunks = list(deduped.values())
+
+        # Order the final context strictly by timestamp across the WHOLE
+        # multi-hop path (not just within an edge) per objective 1's
+        # "order context segments strictly by timestamp sequence across
+        # the full multi-hop path" — so the LLM reads assertions in the
+        # order they actually happened, with the supersede/active tags
+        # telling it which ones are still true by the end of that sequence.
+        ordered_chunks = sorted(tagged_chunks, key=lambda item: _ts_key(item[1]))
+
+        formatted_context = []
+        for text, ts, tag in ordered_chunks:
+            ts_label = ts if ts else "UNKNOWN"
+            if tag:
+                formatted_context.append(f"[{ts_label}] [{tag}] {text}")
+            else:
+                formatted_context.append(f"[{ts_label}] {text}")
         return "\n\n".join(formatted_context)
 
     def query(self, query_text, chunk_store, max_hops=2, hub_degree_threshold=None, hub_fanout_cap=None):
