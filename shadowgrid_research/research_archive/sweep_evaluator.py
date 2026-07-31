@@ -20,6 +20,24 @@ load_dotenv()
 api_key = os.getenv("GROQ_API_KEY")
 ENTITY_PREFIX_PATTERN = re.compile(r"^(Project|Asset|Agent|Concept|Event)\s+", re.IGNORECASE)
 
+# --- Lightweight telemetry helpers ---------------------------------------
+# tiktoken isn't available in every environment this runs in (offline sweep
+# boxes, CI, etc.), so token count here is a whitespace/punctuation
+# approximation, not an exact tokenizer count. It undercounts slightly vs.
+# a real BPE tokenizer (~0.75 tokens per word for English prose is closer
+# to the true ratio) but it's stable, dependency-free, and good enough to
+# compare relative context size *across* configurations (Vector-RAG vs.
+# Bounded/Unbounded GraphRAG), which is what objective 2 actually needs.
+# Swap in `tiktoken.encoding_for_model(...)` for exact counts if/when the
+# dependency is available.
+_TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]")
+
+
+def estimate_tokens(text):
+    if not text:
+        return 0
+    return len(_TOKEN_PATTERN.findall(text))
+
 
 def normalize_entity(name):
     """Strip known operational prefixes and surrounding whitespace so
@@ -47,6 +65,19 @@ class SweepEvaluator:
         # Populated once per document on first extraction and reused across
         # every configuration in the sweep - see get_relations_for_doc.
         self.relation_cache = {}
+
+        # Per-query telemetry for the CURRENT evaluate_*() call only, reset
+        # at the top of each one. Each entry is
+        # {"context_tokens": int, "latency_ms": float} recorded for the
+        # main RAG-answer call (not the judge call - the judge's latency
+        # and token usage are a scoring-infra cost, not a property of the
+        # RAG pipeline being benchmarked). Excluded/errored queries (where
+        # query_cloud_llm returned an ERROR string) are still recorded -
+        # latency was still spent and context was still built - so that
+        # telemetry averages reflect real pipeline cost, matching the
+        # denominator convention used everywhere else (accuracy separately
+        # excludes them, cost does not).
+        self.query_telemetry = []
 
     def load_evaluation_suite(self):
         if not os.path.exists(self.eval_suite_path):
@@ -298,6 +329,22 @@ GRADE: <1 or 0>
 
         return accuracy, excluded, len(valid), type_breakdown, tier1_ratio, tier2_ratio
 
+    def _telemetry_summary(self):
+        """
+        Aggregates self.query_telemetry (populated by the evaluate_*()
+        call that just ran) into the two objective-2 metrics: mean context
+        token count and mean latency in ms, both averaged over every query
+        attempted (including judge-excluded ones - see the field comment
+        on self.query_telemetry for why cost isn't gated on correctness).
+        Returns (avg_tokens, mean_latency_ms), both float('nan') if no
+        telemetry was recorded (e.g. every call errored before timing).
+        """
+        if not self.query_telemetry:
+            return float("nan"), float("nan")
+        avg_tokens = sum(t["context_tokens"] for t in self.query_telemetry) / len(self.query_telemetry)
+        mean_latency = sum(t["latency_ms"] for t in self.query_telemetry) / len(self.query_telemetry)
+        return avg_tokens, mean_latency
+
     def evaluate_vector_baseline(self):
         vector_engine = VectorRAGEngine()
         # TODO(Shiv): confirm this matches the real VectorRAGEngine API - src/vector_engine.py
@@ -306,6 +353,7 @@ GRADE: <1 or 0>
         # Without an explicit push here, retrieve() below runs against an empty index and
         # Control Group A silently returns empty context for every query.
         records = []
+        self.query_telemetry = []
 
         print("\n=== STARTING VECTOR BASELINE EVALUATION ===")
         for q in self.queries:
@@ -321,8 +369,17 @@ GRADE: <1 or 0>
             print(f"----------------------------------")
 
             prompt = f"Context:\n{context}\n\nQuestion: {q['query']}\nAnswer thoroughly, including all relevant background details, project names, and migration history mentioned in the context."
+
+            t0 = time.perf_counter()
             output = self.query_cloud_llm(prompt)
+            latency_ms = (time.perf_counter() - t0) * 1000.0
+            self.query_telemetry.append({
+                "query_id": qid,
+                "context_tokens": estimate_tokens(context),
+                "latency_ms": latency_ms,
+            })
             print(f"[LLM OUTPUT]: {output}")
+            print(f"[TELEMETRY] context_tokens={estimate_tokens(context)} latency_ms={latency_ms:.1f}")
 
             score = self.verify_accuracy_with_judge(q['query'], q['ground_truth'], output, query_id=qid)
             # Vector-RAG has no tiered memory - tier fields stay None so
@@ -330,7 +387,8 @@ GRADE: <1 or 0>
             records.append({"query_id": qid, "type": qtype, "score": score,
                              "tier1_hit": None, "tier2_hit": None})
 
-        return self._score_summary(records)
+        avg_tokens, mean_latency = self._telemetry_summary()
+        return self._score_summary(records) + (avg_tokens, mean_latency)
 
     def evaluate_graph_engine(self, max_edges):
         graph_engine = BoundedGraphRAGEngine(max_edges=max_edges)
@@ -353,6 +411,7 @@ GRADE: <1 or 0>
               f"(should be 0 after the reinsert-purge fix)")
 
         records = []
+        self.query_telemetry = []
 
         print(f"\n=== STARTING GRAPH RAG EVALUATION (max_edges={max_edges}) ===")
         for q in self.queries:
@@ -373,35 +432,75 @@ GRADE: <1 or 0>
             print(context if context.strip() else "[EMPTY CONTEXT]")
             print(f"---------------------------------")
 
+            # Case-B fix: retrieval (graph_engine.py) was verified via an
+            # isolated offline trace to already deliver every target
+            # entity's connecting facts into context for the multi_hop /
+            # multi_hop_contradiction queries (see diagnosis notes). The
+            # remaining failure mode this prompt guards against is
+            # synthesis - the model has the right facts in front of it but
+            # doesn't explicitly walk the entity chain before answering, so
+            # it's prone to answering from the most salient sentence
+            # instead of the one the 2-hop question actually depends on.
+            # Forcing an explicit "trace the path" step before the answer
+            # (chain-of-thought over entity hops, not over arithmetic)
+            # makes that walk visible and checkable in the transcript.
             prompt = (
                 f"Context entries are timestamped and listed in chronological order "
                 f"from oldest to newest. Later entries explicitly supersede earlier "
                 f"ones when facts or system states conflict.\n\n"
-                f"Context:\n{context}\n\nQuestion: {q['query']}\nAnswer thoroughly, "
-                f"including all relevant background details, project names, and "
-                f"migration history mentioned in the context."
+                f"Context:\n{context}\n\nQuestion: {q['query']}\n\n"
+                f"Before answering, trace the entity path the question depends on: "
+                f"list, in order, each named entity/edge you must cross to connect "
+                f"the entities in the question to each other, noting for each hop "
+                f"whether the context marks it ACTIVE/LATEST or SUPERSEDED/HISTORICAL. "
+                f"Then give the final answer, using only the ACTIVE/LATEST state at "
+                f"each hop unless the question explicitly asks about history.\n\n"
+                f"Respond in this exact format:\n"
+                f"ENTITY PATH: <hop-by-hop trace>\n"
+                f"ANSWER: <thorough final answer, including all relevant background "
+                f"details, project names, and migration history mentioned in the context>"
             )
-            output = self.query_cloud_llm(prompt)
-            print(f"[LLM OUTPUT]: {output}")
 
-            score = self.verify_accuracy_with_judge(q['query'], q['ground_truth'], output, query_id=qid)
+            t0 = time.perf_counter()
+            output = self.query_cloud_llm(prompt)
+            latency_ms = (time.perf_counter() - t0) * 1000.0
+            self.query_telemetry.append({
+                "query_id": qid,
+                "context_tokens": estimate_tokens(context),
+                "latency_ms": latency_ms,
+            })
+            print(f"[LLM OUTPUT]: {output}")
+            print(f"[TELEMETRY] context_tokens={estimate_tokens(context)} latency_ms={latency_ms:.1f}")
+
+            # Judge grades against the full output; strip the ENTITY PATH
+            # preamble first so the judge scores the ANSWER section only -
+            # otherwise a correct answer paired with speculative
+            # intermediate reasoning could get judged on scratch-work
+            # rather than the final claim.
+            answer_only = output
+            m = re.search(r"ANSWER:\s*(.*)", output, re.DOTALL)
+            if m:
+                answer_only = m.group(1).strip()
+
+            score = self.verify_accuracy_with_judge(q['query'], q['ground_truth'], answer_only, query_id=qid)
             records.append({"query_id": qid, "type": qtype, "score": score,
                              "tier1_hit": tier1_hit, "tier2_hit": tier2_hit})
 
         print(f"[TIER METRICS] engine.metrics for max_edges={max_edges}: {graph_engine.metrics}")
 
-        return self._score_summary(records)
+        avg_tokens, mean_latency = self._telemetry_summary()
+        return self._score_summary(records) + (avg_tokens, mean_latency)
 
     def execute_sweep(self):
         results = {}
 
         print("[RUNNING] Evaluating Control Group A: Baseline Vector-RAG...")
-        acc, excluded, n, breakdown, t1, t2 = self.evaluate_vector_baseline()
-        results["Vector-RAG (Control A)"] = (acc, excluded, n, breakdown, t1, t2)
+        acc, excluded, n, breakdown, t1, t2, avg_tok, lat_ms = self.evaluate_vector_baseline()
+        results["Vector-RAG (Control A)"] = (acc, excluded, n, breakdown, t1, t2, avg_tok, lat_ms)
 
         print("[RUNNING] Evaluating Control Group B: Unbounded GraphRAG (max_edges = inf)...")
-        acc, excluded, n, breakdown, t1, t2 = self.evaluate_graph_engine(max_edges=float('inf'))
-        results["Unbounded GraphRAG (Control B)"] = (acc, excluded, n, breakdown, t1, t2)
+        acc, excluded, n, breakdown, t1, t2, avg_tok, lat_ms = self.evaluate_graph_engine(max_edges=float('inf'))
+        results["Unbounded GraphRAG (Control B)"] = (acc, excluded, n, breakdown, t1, t2, avg_tok, lat_ms)
 
         print("[RUNNING] Executing Parameter Sweep for Bounded GraphRAG...")
         # Wide, log-scaled steps: at max_edges in the 2-10 range, BoundedGraphRAGEngine
@@ -411,16 +510,17 @@ GRADE: <1 or 0>
         # the eviction-vs-accuracy curve actually differentiates from the unbounded control.
         sweep_edges = [2, 5, 10, 25, 50, 100, 250, 500]
         for edges in sweep_edges:
-            acc, excluded, n, breakdown, t1, t2 = self.evaluate_graph_engine(max_edges=edges)
-            results[f"Bounded GraphRAG (max_edges={edges})"] = (acc, excluded, n, breakdown, t1, t2)
+            acc, excluded, n, breakdown, t1, t2, avg_tok, lat_ms = self.evaluate_graph_engine(max_edges=edges)
+            results[f"Bounded GraphRAG (max_edges={edges})"] = (acc, excluded, n, breakdown, t1, t2, avg_tok, lat_ms)
             excl_note = f" (excluded {excluded} invalid data points)" if excluded else ""
             tier_note = f" | Tier1 Hit: {t1:.1f}% | Tier2 Hit: {t2:.1f}%" if t1 is not None else ""
-            print(f" -> Configuration max_edges={edges} | Accuracy: {acc:.2f}% over {n} valid queries{excl_note}{tier_note}")
+            print(f" -> Configuration max_edges={edges} | Accuracy: {acc:.2f}% over {n} valid queries{excl_note}{tier_note}"
+                  f" | Avg Tokens: {avg_tok:.0f} | Mean Latency: {lat_ms:.0f}ms")
 
         print("\n" + "=" * 65)
         print("FINAL HYPERPARAMETER SWEEP METRICS")
         print("=" * 65)
-        for config, (acc, excluded, n, breakdown, t1, t2) in results.items():
+        for config, (acc, excluded, n, breakdown, t1, t2, avg_tok, lat_ms) in results.items():
             acc_str = f"{acc:.2f}%" if n > 0 else "N/A (no valid data)"
             excl_note = f"  [excluded {excluded}]" if excluded else ""
             print(f"{config:<35}: {acc_str:<20} n={n}{excl_note}")
@@ -431,7 +531,7 @@ GRADE: <1 or 0>
         all_types = sorted({t for r in results.values() for t in r[3].keys()})
         header = f"{'Configuration':<35}" + "".join(f"{t:<24}" for t in all_types)
         print(header)
-        for config, (acc, excluded, n, breakdown, t1, t2) in results.items():
+        for config, (acc, excluded, n, breakdown, t1, t2, avg_tok, lat_ms) in results.items():
             row = f"{config:<35}"
             for t in all_types:
                 if t in breakdown:
@@ -449,10 +549,19 @@ GRADE: <1 or 0>
         print("MEMORY TIER UTILIZATION (Tier 1 Active vs Tier 2 Archive)")
         print("=" * 65)
         print(f"{'Configuration':<35}{'Tier 1 Hit Ratio':<20}{'Tier 2 Hit Ratio':<20}")
-        for config, (acc, excluded, n, breakdown, t1, t2) in results.items():
+        for config, (acc, excluded, n, breakdown, t1, t2, avg_tok, lat_ms) in results.items():
             if t1 is None:
                 continue
             print(f"{config:<35}{t1:>6.1f}%{'':<13}{t2:>6.1f}%")
+
+        print("\n" + "=" * 65)
+        print("TELEMETRY: AVG CONTEXT TOKENS / MEAN LATENCY (ms)")
+        print("=" * 65)
+        print(f"{'Configuration':<35}{'Avg Tokens':<15}{'Mean Latency (ms)':<20}")
+        for config, (acc, excluded, n, breakdown, t1, t2, avg_tok, lat_ms) in results.items():
+            print(f"{config:<35}{avg_tok:<15.0f}{lat_ms:<20.1f}")
+
+        return results
 
 
 if __name__ == "__main__":
