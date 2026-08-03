@@ -9,6 +9,31 @@ from datetime import datetime
 # "close enough" to the freshly-recomputed value to trust without a re-push.
 ENTROPY_STALENESS_EPSILON = 1e-9
 
+# Fraction of max_edges used to derive the per-node top-k cap on Tier 2
+# (cold archive) fallback edges — see BoundedGraphRAGEngine.__init__ /
+# _archived_edges_for_node. Without a cap here, a node's archived-edge
+# fanout grows with total eviction history over the engine's lifetime
+# instead of with max_edges, which is what let the Tier 2 fallback dump
+# every evicted edge for a node into context regardless of how tightly
+# max_edges bounded the active tier (observed as a flat ~993-token
+# payload across configurations). Tying it to max_edges instead keeps
+# the archive contribution proportional to the same memory budget the
+# active tier already respects.
+TIER2_TOPK_FRACTION = 0.2
+
+# Fixed additive offset applied to an edge's entropy score when
+# _bridge_risk() finds NO local detour (bridge_risk == 1.0) — see
+# BoundedGraphRAGEngine._compute_local_edge_entropy. Must comfortably
+# exceed the maximum possible base_entropy value so a hard-protected edge
+# always outranks every non-bridge edge in the min-heap regardless of
+# degree. base_entropy is bounded by two terms of -p*log2(p) with
+# p = degree / (2 * total_edges) <= 0.5 in the extreme case (a single
+# node touching every edge at max_edges=50); that function peaks at
+# ~0.53 per term, ~1.06 combined, and the softer (1 + bridge_risk)
+# multiplier used for partial-detour edges can at most double that to
+# ~2.12. 1000 leaves orders of magnitude of headroom.
+BRIDGE_PROTECTION_OFFSET = 1000.0
+
 # Entity extraction: a run of one or more consecutive capitalized "words",
 # where each word may contain letters, digits, and hyphens ("Asset Qdrant",
 # "New York", "Verification-Run-1", "Qdrant-2" all match as single spans).
@@ -144,6 +169,23 @@ class BoundedGraphRAGEngine:
     def __init__(self, max_edges=50, max_archive=500):  # Hardcoded optimal 50
         self.max_edges = max_edges
         self.max_archive = max_archive
+
+        # Per-node cap on how many Tier 2 (archive) edges
+        # _archived_edges_for_node will surface during context building —
+        # see TIER2_TOPK_FRACTION above and _archived_edges_for_node
+        # below for the ranking/selection logic. None when max_edges is
+        # unbounded (float('inf'), used by the "Unbounded GraphRAG"
+        # control group): in that regime insert_edge's eviction loop
+        # (`while len(self.edges) > self.max_edges`) never fires, so
+        # self.archive stays permanently empty and there is nothing for
+        # a cap to bound — leaving it uncapped here just avoids a
+        # meaningless math.ceil(inf * fraction) call.
+        self.tier2_topk = (
+            max(1, math.ceil(max_edges * TIER2_TOPK_FRACTION))
+            if math.isfinite(max_edges)
+            else None
+        )
+
         self.node_degrees = defaultdict(int)
         self.adjacency = defaultdict(set)
         self.edges = {}  # (src, tgt) -> true_current_entropy
@@ -189,6 +231,37 @@ class BoundedGraphRAGEngine:
         # so retrieve_subgraph_context never rebuilds it from scratch.
         self.archive_index = defaultdict(dict)
 
+    def _bridge_risk(self, src, tgt):
+        """
+        Cheap local proxy for "is (src, tgt) a bridge edge" — does cutting
+        it remove the ONLY short path between src and tgt, or does a 2-hop
+        detour through a shared neighbor survive the cut?
+
+        NOT exact bridge/cut-vertex detection — that's an O(V+E) traversal
+        per candidate, too expensive to run on every insert_edge call at
+        this bound. This is a 1-hop redundancy proxy instead: if src and
+        tgt share at least one OTHER neighbor, the path (src -> shared ->
+        tgt) survives after this edge is cut, so multi-hop retrieval only
+        loses directness, not reachability. If they share none, this edge
+        is the entire connection between src's side of the graph and tgt's
+        side as currently known — cutting it is a real topology break, not
+        a redundant trim.
+
+        Returns a value in [0.0, 1.0]: 1.0 = no local detour exists
+        (protect this edge), scaling toward 0.0 as neighbor overlap
+        (Jaccard over the two neighbor sets, each excluding the other
+        endpoint) grows (safe to treat as redundant).
+        """
+        src_neighbors = self.adjacency.get(src, set()) - {tgt}
+        tgt_neighbors = self.adjacency.get(tgt, set()) - {src}
+        if not src_neighbors or not tgt_neighbors:
+            # One endpoint has no other connection at all — this edge is
+            # by definition its only link to the rest of the graph.
+            return 1.0
+        shared = len(src_neighbors & tgt_neighbors)
+        union = len(src_neighbors | tgt_neighbors)
+        return 1.0 - (shared / union if union else 0.0)
+
     def _compute_local_edge_entropy(self, src, tgt):
         deg_src = self.node_degrees.get(src, 1)
         deg_tgt = self.node_degrees.get(tgt, 1)
@@ -197,7 +270,41 @@ class BoundedGraphRAGEngine:
         p_src = deg_src / (2 * total_edges)
         p_tgt = deg_tgt / (2 * total_edges)
 
-        return - (p_src * math.log2(p_src) + p_tgt * math.log2(p_tgt))
+        base_entropy = - (p_src * math.log2(p_src) + p_tgt * math.log2(p_tgt))
+
+        # --- Bridge protection ---
+        # base_entropy is a pure function of LOCAL DEGREE, and degree
+        # magnitude dominates it: an edge touching ANY low-degree node
+        # scores low regardless of whether that node is a boring redundant
+        # leaf or the sole connector holding a whole cluster onto the rest
+        # of the graph (e.g. CobaltMesh <-> Ivo with no shared neighbor).
+        # A first attempt at fixing this multiplied base_entropy by
+        # (1 + bridge_risk) — but that only shifts the score by up to 2x,
+        # which is nowhere near enough: a hub-to-leaf edge like
+        # (MongoDB, leaf) with degree 13 vs 1 scores ~1.3 even after the
+        # penalty-free case, while a genuine bridge like (ClusterX, Ivo)
+        # with degree 1 vs 3 scores ~0.57 even after full protection —
+        # the bridge still looks "cheaper" to a min-heap and gets evicted
+        # FIRST, exactly backwards. Verified by direct construction before
+        # settling on this version.
+        #
+        # Fix: make "no local detour exists" a HARD priority tier, not a
+        # soft multiplier — mirrors the guaranteed/bridges/ordinary tiering
+        # _select_expansion_edges already uses at query time (bridges
+        # bypass ranking entirely there too). bridge_risk == 1.0 means src
+        # and tgt share zero other neighbors — no 2-hop detour exists at
+        # all if this edge is cut — so it's pushed by a fixed offset large
+        # enough to outrank every realistic base_entropy value (bounded
+        # under ~2.2 given max_edges=50; 1000 leaves an enormous margin).
+        # That guarantees these edges are the LAST ones a min-heap ever
+        # pops, evicted only once every edge with an actual alternate path
+        # is already gone. Edges with a PARTIAL detour (0 < bridge_risk <
+        # 1) stay in the normal tier, where the softer multiplier still
+        # meaningfully reorders them relative to fully-redundant edges.
+        bridge_risk = self._bridge_risk(src, tgt)
+        if bridge_risk >= 1.0:
+            return base_entropy + BRIDGE_PROTECTION_OFFSET
+        return base_entropy * (1.0 + bridge_risk)
 
     def _garbage_collect_nodes(self, src, tgt):
         for node in (src, tgt):
@@ -299,9 +406,57 @@ class BoundedGraphRAGEngine:
         the eviction itself, instead of leaving that bookkeeping to a
         per-query rebuild (the old _build_archive_index, see below).
         """
-        print(f"[EVICTION TELEMETRY] Purging Edge: ({victim_src} <-> {victim_tgt})")
-        print(f"  -> Active Degree of {victim_src}: {self.node_degrees.get(victim_src, 0)}")
-        print(f"  -> Active Degree of {victim_tgt}: {self.node_degrees.get(victim_tgt, 0)}")
+        # --- Eviction telemetry ---
+        # Logged here (not at the raw heapq.heappop() in insert_edge)
+        # because a pop can also be a stale heap entry — one whose cached
+        # entropy no longer matches a freshly-recomputed true_entropy — that
+        # insert_edge re-pushes and loops past without evicting anything.
+        # This point, immediately after insert_edge has confirmed a real
+        # eviction and handed us live_entropy, is the earliest place a pop
+        # is guaranteed to be an actual victim. degree(u)/degree(v) are
+        # read from self.node_degrees BEFORE _garbage_collect_nodes runs
+        # below, so they capture each endpoint's true active degree at the
+        # moment it was chosen as a victim — exactly what's needed to tell
+        # "Fringe Pruning" (both endpoints low-degree, ~1-3: trimming a
+        # leaf) apart from "Hub Decapitation" (an endpoint with high active
+        # degree: a structural routing hub just got cut) from the logs
+        # alone, instead of only inferring it after the fact from a
+        # multi-hop accuracy regression.
+        degree_u = self.node_degrees.get(victim_src, 0)
+        degree_v = self.node_degrees.get(victim_tgt, 0)
+
+        # Classification fix: the old rule ("max(degree) > 3 ->
+        # HUB DECAPITATION") only asks whether EITHER endpoint is
+        # well-connected. In a graph where most edges are Hub <-> leaf /
+        # connector, that rule labeled nearly every post-saturation
+        # eviction "HUB DECAPITATION" even when it was a harmless trim of
+        # one of the hub's many redundant spokes — burying the evictions
+        # that actually mattered in noise. bridge_risk (the same signal
+        # now driving eviction priority above, recomputed here
+        # pre-mutation) tells the two cases apart:
+        #   - an alternate 2-hop path survives  -> HUB SPOKE TRIM (benign,
+        #     expected churn under a hard edge cap)
+        #   - no local detour exists at all     -> BRIDGE SEVERED (the
+        #     actual failure mode from the bug report)
+        # bridge_risk >= 1.0 lines up with the hard protection tier in
+        # _compute_local_edge_entropy: under normal operation those edges
+        # only get popped once every edge with an actual alternate path is
+        # gone, so seeing this label at all means the graph is genuinely
+        # out of redundant edges to sacrifice — a real signal, not noise.
+        bridge_risk = self._bridge_risk(victim_src, victim_tgt)
+        if bridge_risk >= 1.0:
+            eviction_class = "BRIDGE SEVERED"
+        elif max(degree_u, degree_v) <= 3:
+            eviction_class = "FRINGE PRUNING"
+        else:
+            eviction_class = "HUB SPOKE TRIM"
+
+        print(
+            f"[EVICTION TELEMETRY] Popped victim edge: ({victim_src} <-> {victim_tgt}) | "
+            f"H_e={live_entropy:.6f} | degree({victim_src})={degree_u} | "
+            f"degree({victim_tgt})={degree_v} | bridge_risk={bridge_risk:.3f} | "
+            f"classification={eviction_class}"
+        )
 
         entry = {
             "src": victim_src,
@@ -361,11 +516,29 @@ class BoundedGraphRAGEngine:
         Replaces the old pattern of calling _build_archive_index() and then
         indexing into its result. Tagged "archive" (Tier 2) — see
         _edges_for_node.
+
+        Top-k capped at self.tier2_topk (see __init__ / TIER2_TOPK_FRACTION).
+        self.archive_index accumulates across the engine's WHOLE eviction
+        history — a long-running node can end up touching far more archived
+        edges than max_edges would ever let it touch while active — and
+        returning all of them uncapped is what produced a flat, ~993-token
+        Tier 2 payload regardless of max_edges. When over the cap, rank by
+        entropy_at_eviction descending and keep the highest-entropy subset:
+        higher local entropy means the edge's endpoints were less
+        redundant/hub-like relative to the rest of the graph at the moment
+        they were evicted, i.e. the more structurally distinctive — and
+        more likely still query-relevant — evicted edges. Ties (and the
+        common case of a small archive_index bucket) fall through the
+        length check below without paying for a sort.
         """
-        return [
+        candidates = [
             (neighbor, key, entropy, "archive")
             for key, (neighbor, entropy) in self.archive_index.get(node, {}).items()
         ]
+        if self.tier2_topk is None or len(candidates) <= self.tier2_topk:
+            return candidates
+        candidates.sort(key=lambda item: item[2], reverse=True)
+        return candidates[: self.tier2_topk]
 
     def _build_archive_index(self):
         """
