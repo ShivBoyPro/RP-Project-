@@ -30,7 +30,7 @@ H_e = α · w_semantic + β · ln(C_traverse + 1) − γ · Δt
 
 ## Session 2 — July 1, 2026
 
-### What We Did
+### What I Did
 Ran the full hyperparameter sweep planned in Session 1, migrated the eval harness off local Ollama to a cloud API, and fought through a long chain of infrastructure bugs before landing on a clean, valid result.
 
 ### Key Decision: Ollama → Cloud API
@@ -77,8 +77,8 @@ Root cause: **generation/eval mismatch, not retrieval.** The prompt said "Answer
 
 ## Session 3 — July 2, 2026
 
-### What We Did
-Took the "100% on toy data" result from Session 2 and stress-tested it properly: refactored the graph engine for real bounded-memory streaming, replaced hardcoded string-matching extraction with an actual ≤8B LLM extraction pipeline (Groq / `llama-3.1-8b-instant`), scaled the eval suite from n=3 to n=20, and ran two full sweeps. The toy-data 100% collapsed — as expected — and we found (and are still confirming) two real pathologies.
+### What I Did
+Took the "100% on toy data" result from Session 2 and stress-tested it properly: refactored the graph engine for real bounded-memory streaming, replaced hardcoded string-matching extraction with an actual ≤8B LLM extraction pipeline (Groq / `llama-3.1-8b-instant`), scaled the eval suite from n=3 to n=20, and ran two full sweeps. The toy-data 100% collapsed — as expected — and I found (and am still confirming) two real pathologies.
 
 ### Key Refactor: Faked Entropy → Real Bounded Engine
 Session 2's `graph_engine.py` was a hardcoded script, not an entropy engine. It violated the thesis four ways:
@@ -158,7 +158,7 @@ Rejected Gemini's earlier "mathematical phase transition / clustering-coefficien
 
 ## Session 4 — July 6, 2026
 
-### What We Did
+### What I Did
 Pivoted the thesis from a data-destructive eviction policy to a **Tiered Memory (Active-Archive)** architecture at the counselor's suggestion, refactored the engine to archive evicted edges instead of deleting them, added Tier 1/Tier 2 utilization telemetry to the sweep, and ran it. The result surfaced a metric-saturation bug that's still open.
 
 ### Key Pivot: "The Purge" → "The Librarian"
@@ -210,8 +210,8 @@ for record in self.archive:
 
 ## Session 5 - July 7, 2026
 
-### What We Did
-Applied the cache-miss filter from Session 4, re-ran the tiered sweep, and hit the same flat 100% Tier 2 ratio. That forced a reframe: the saturation is probably **not** a residual bug but a **scope artifact** — the sweep range (max_edges 2–10) is far below the true graph size, so the engine is starved at every config we tested. Also surfaced a second, independent confound: cross-project context bleed from string-equality edge dedup. No new conclusions locked in yet — this session ends with three verification steps queued, not fixes.
+### What I Did
+Applied the cache-miss filter from Session 4, re-ran the tiered sweep, and hit the same flat 100% Tier 2 ratio. That forced a reframe: the saturation is probably **not** a residual bug but a **scope artifact** — the sweep range (max_edges 2–10) is far below the true graph size, so the engine is starved at every config I tested. Also surfaced a second, independent confound: cross-project context bleed from string-equality edge dedup. No new conclusions locked in yet — this session ends with three verification steps queued, not fixes.
 
 ### What Got Built / Changed
 - **`graph_engine.py`** — `retrieve_subgraph_context` now carries the **cache-miss filter**: the Tier 2 archive loop skips any edge still active in Tier 1 (`if (src, tgt) in self.edges or (tgt, src) in self.edges: continue`). This applies the guard at retrieval time (O(1) per record) rather than pruning the archive on insert, so ingestion throughput is untouched. Architecture otherwise unchanged — tiered layout, eviction handshake, and stale-heap check all intact.
@@ -235,7 +235,7 @@ Applied the cache-miss filter from Session 4, re-ran the tiered sweep, and hit t
 The cache-miss filter worked as written, but Tier 2 is **still pinned at 100%** across the whole bounded range, including max_edges=10.
 
 ### The Reframe: Scope Artifact, Not a Bug
-The `BoundedGraphRAGEngine` is a **single instance ingesting all 5 projects into one shared graph**, and `max_edges` is a **global cap** across that entire graph — not per-project. The corpus generates a co-occurrence pair for every entity pair in every document across 5 projects × 5 docs, which likely produces **40–70+ unique edges**. If so, then max_edges=10 isn't "slightly tight" — it forces eviction of the vast majority of edges at *every* config we swept. A flat 100% Tier 2 across 2–10 wouldn't be a residual bug; it would mean the whole sweep is running deep in the **starved zone**, and we simply haven't swept far enough to reach the point where Tier 1 can hold enough of the graph for Tier 2 reliance to drop.
+The `BoundedGraphRAGEngine` is a **single instance ingesting all 5 projects into one shared graph**, and `max_edges` is a **global cap** across that entire graph — not per-project. The corpus generates a co-occurrence pair for every entity pair in every document across 5 projects × 5 docs, which likely produces **40–70+ unique edges**. If so, then max_edges=10 isn't "slightly tight" — it forces eviction of the vast majority of edges at *every* config I swept. A flat 100% Tier 2 across 2–10 wouldn't be a residual bug; it would mean the whole sweep is running deep in the **starved zone**, and I simply haven't swept far enough to reach the point where Tier 1 can hold enough of the graph for Tier 2 reliance to drop.
 
 ### Second Confound Flagged: Cross-Project Bleed
 `insert_edge`'s dedup is pure string equality: `(src, tgt) in self.edges or (tgt, src) in self.edges`. The generator deliberately reuses entity names across projects (multiple projects can independently draw `PostgreSQL` as `db_old`, or `Alexander` as an engineer). If two projects produce the identical pair, `insert_edge` collapses them to one edge key and `chunk_store.add_extraction` accumulates text chunks from **both projects** under that key. So a query about Project X could silently pull prose about Project Y. This is a plausible mechanism for why Unbounded GraphRAG underperformed Vector-RAG on single-hop query types, and it applies **independently of eviction**, at every max_edges including unbounded.
@@ -243,7 +243,7 @@ The `BoundedGraphRAGEngine` is a **single instance ingesting all 5 projects into
 ### Next Steps (queued, in order — verify before fixing)
 1. **Measure true graph scale.** After ingestion: `print(f"[GRAPH SCALE] Unique edges ever inserted: {len(graph_engine.edges) + len(graph_engine.archive)}")`. This sets the real upper bound for the sweep.
 2. **Widen the sweep** from `range(2, 11)` to a stepped range up past the graph-scale number (e.g. 2, 5, 10, 20, 30, 40, 50, 60 + unbounded control) to see whether Tier 2 finally bends toward 0%. If it does → the fix works and 100% was purely a scope artifact. If it stays at 100% past graph scale → a real bug remains.
-3. **Test cross-project bleed directly.** Pick one recurring entity name, print `chunk_store.get_context(*)` for a pair containing it after full ingestion, and check whether the returned texts mention two different project names. Confirm/deny only — don't fix scoping until we know it's real.
+3. **Test cross-project bleed directly.** Pick one recurring entity name, print `chunk_store.get_context(*)` for a pair containing it after full ingestion, and check whether the returned texts mention two different project names. Confirm/deny only — don't fix scoping until I know it's real.
 
 ### Open Questions
 - What is the actual [GRAPH SCALE] number? (Determines whether the sweep was ever in a meaningful range.)
@@ -252,7 +252,7 @@ The `BoundedGraphRAGEngine` is a **single instance ingesting all 5 projects into
 
 ## Session 6 — July 9, 2026
 
-### What We Did
+### What I Did
 Closed a test-validity leak that had been inflating every GraphRAG number, replaced the deterministic extractor in `sweep_evaluator.py` with real (cached) LLM extraction, and re-ran the sweep. The inflated result collapsed: **Vector-RAG now beats Bounded GraphRAG (65% vs 35–45%).** Pinned the max_edges=10 cliff to one flipped query and confirmed three bugs in `graph_engine.py`. No fixes committed.
 
 ### The Real Bug: Test-Validity Leak
@@ -342,8 +342,8 @@ The stale "MySQL handles metadata" chunk appears twice — once Tier 1, once Tie
 
 ## Session 7 — July 11, 2026
 
-### What We Did
-Completed the full hyperparameter sweep for the Bounded GraphRAG architecture. We evaluated the system against the generated evaluation suite (n=20) across a range of edge constraints ($max\_edges = 2, 5, 10, 25, 50, 100, 250, 500$) and the Unbounded GraphRAG and Vector-RAG control groups. This session concludes the optimization phase of the experiment.
+### What I Did
+Completed the full hyperparameter sweep for the Bounded GraphRAG architecture. I evaluated the system against the generated evaluation suite (n=20) across a range of edge constraints ($max\_edges = 2, 5, 10, 25, 50, 100, 250, 500$) and the Unbounded GraphRAG and Vector-RAG control groups. This session concludes the optimization phase of the experiment.
 
 ### Final Sweep Results
 The metrics confirm that accuracy saturates at $max\_edges=50$. Increasing memory capacity beyond this point yields zero accuracy gains, suggesting the graph has reached a point of structural condensation where all critical relational signal fits into the Active (Tier 1) memory.
@@ -392,7 +392,7 @@ The metrics confirm that accuracy saturates at $max\_edges=50$. Increasing memor
 
 ## Session 8 — July 14, 2026
 
-### What We Did
+### What I Did
 Completed the security and production-readiness lockdown for the Bounded GraphRAG codebase. Focused on credential isolation, transport security, and structural integration of the `BoundedChunkStore` with the engine's query interface.
 
 ### Production Readiness Checklist
@@ -419,7 +419,7 @@ The system is now architecturally robust, secured, and compliant with production
 
 ## Session 9 — July 18, 2026
 
-### What We Did
+### What I Did
 Resolved the runtime `(no context found)` engine failure. Rewrote the broken ingestion layer (`src/ingestor.py`) to replace the hardcoded fallback architecture with an automated proper-noun relational extraction pipeline. Verified the runtime query loop using multi-hop context lookups across live entities.
 
 ### Core Issue: The "System" Hub Pathology
@@ -458,7 +458,7 @@ The pipeline is fully operational. The entity matching desynchronization is reso
 
 ## Session 10 — July 19, 2026
 
-### What We Did
+### What I Did
 Executed a systematic code overhaul to align the ingestion and query pipelines, resolved critical active-archive hub calculation mismatches, bounded historical memory growth, and audited the retrieval path for remaining extraction anomalies[cite: 4, 5].
 
 ### Core Architectural Fixes
@@ -493,7 +493,7 @@ Executed a systematic code overhaul to align the ingestion and query pipelines, 
 
 ## Session 11 — July 21, 2026
 
-### What We Did
+### What I Did
 Shelved the heavy, LLM-dependent `sweep_evaluator.py` harness to completely eliminate unnecessary API overhead and slow iteration cycles. Pivoted active development entirely to a lightweight, deterministic, and fast operational benchmark script (`evaluate.py`) dedicated to local regression testing, precision checks, and sub-graph traversal latency tracking.
 
 ### Key Architectural & Workflow Changes
@@ -561,7 +561,7 @@ Shelved the heavy, LLM-dependent `sweep_evaluator.py` harness to completely elim
 
 ## Session 12 — July 28, 2026
 
-### What We Did
+### What I Did
 Resolved the remaining chunk store collisions, executed a full hyperparameter sweep across the updated pipeline, verified the temporal drift fix, and isolated the root cause of the persistent multi-hop accuracy collapse.
 
 ### Core Architecture & Pipeline Fixes
@@ -584,7 +584,7 @@ Resolved the remaining chunk store collisions, executed a full hyperparameter sw
 
 ## Session 13 — July 29, 2026
 
-### What We Did
+### What I Did
 Patched the hub-capping bottleneck in `src/graph_engine.py`, fixed a symmetric heap-refresh duplication bug, and ran a full hyperparameter sweep across all memory configurations ($max\_edges=2$ through $500$).
 
 ### Core Engine Fixes
@@ -612,7 +612,7 @@ Patched the hub-capping bottleneck in `src/graph_engine.py`, fixed a symmetric h
 
 ## Session 14 — July 30, 2026
 
-### What We Did
+### What I Did
 - Implemented edge-aware chunk keying `(canonical_edge_key, text, timestamp)` and per-edge chronological state tagging in `src/graph_engine.py`.
 - Added post-tagging deduplication to prevent cross-edge text duplication while preserving state tags.
 - Ran the full hyperparameter sweep across memory configurations ($max\_edges=2 \dots 500$) and baseline controls.
